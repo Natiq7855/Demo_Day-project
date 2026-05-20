@@ -68,6 +68,15 @@ def upload_practice_exam(
     return {"id": exam.id, "title": exam.title}
 
 
+@router.get("/admin/list")
+def list_practice_exams_admin(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    exams = db.query(PracticeExam).order_by(PracticeExam.created_at.desc()).all()
+    return [{"id": item.id, "title": item.title, "created_at": item.created_at} for item in exams]
+
+
 @router.get("/student/list")
 def list_practice_exams(
     db: Session = Depends(get_db),

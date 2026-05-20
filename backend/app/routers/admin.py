@@ -32,6 +32,22 @@ def list_students(
     return [{"id": user.id, "email": user.email, "status": user.status.value} for user in users]
 
 
+@router.get("/pdfs")
+def list_pdfs(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    pdfs = db.query(Pdf).order_by(Pdf.created_at.desc()).all()
+    return [
+        {
+            "id": item.id,
+            "title": item.title,
+            "created_at": item.created_at,
+        }
+        for item in pdfs
+    ]
+
+
 @router.post("/upload-pdf")
 def upload_pdf(
     title: str = Form(...),
