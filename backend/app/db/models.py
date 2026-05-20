@@ -191,6 +191,16 @@ class PracticeExamAttempt(Base):
     submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class PracticeExamAssignment(Base):
+    __tablename__ = "practice_exam_assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    practice_exam_id: Mapped[int] = mapped_column(ForeignKey("practice_exams.id"))
+    target_type: Mapped[str] = mapped_column(String(20))
+    target_id: Mapped[int] = mapped_column(Integer)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class LessonLink(Base):
     __tablename__ = "lesson_links"
 

@@ -168,6 +168,15 @@ def upgrade() -> None:
     )
 
     op.create_table(
+        "practice_exam_assignments",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("practice_exam_id", sa.Integer(), sa.ForeignKey("practice_exams.id")),
+        sa.Column("target_type", sa.String(length=20), nullable=False),
+        sa.Column("target_id", sa.Integer(), nullable=False),
+        sa.Column("assigned_at", sa.DateTime(), server_default=sa.text("NOW()"), nullable=False),
+    )
+
+    op.create_table(
         "lesson_links",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("title", sa.String(length=255), nullable=False),
@@ -192,6 +201,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("monthly_exam_grades")
     op.drop_table("lesson_links")
+    op.drop_table("practice_exam_assignments")
     op.drop_table("practice_exam_attempts")
     op.drop_table("practice_exams")
     op.drop_table("roadmap_state")

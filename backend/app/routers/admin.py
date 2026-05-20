@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -73,3 +74,20 @@ def upload_pdf(
 
     db.commit()
     return {"pdf_id": pdf.id, "chunks": chunk_count}
+
+
+@router.get("/download-pdf/{pdf_id}")
+def download_pdf(
+    pdf_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    pdf = db.get(Pdf, pdf_id)
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    file_path = Path(pdf.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(path=file_path, filename=file_path.name)

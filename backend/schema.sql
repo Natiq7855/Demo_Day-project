@@ -129,6 +129,14 @@ CREATE TABLE practice_exam_attempts (
     submitted_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE practice_exam_assignments (
+    id SERIAL PRIMARY KEY,
+    practice_exam_id INTEGER REFERENCES practice_exams(id),
+    target_type VARCHAR(20) NOT NULL,
+    target_id INTEGER NOT NULL,
+    assigned_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE lesson_links (
     id SERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,

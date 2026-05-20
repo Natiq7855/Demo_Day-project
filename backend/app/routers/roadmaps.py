@@ -1,18 +1,25 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import and_, distinct, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.security import require_admin, require_student
 from app.db.models import (
     AttemptStatus,
+    Class,
     PdfChunk,
+    Group,
     RoadmapAttempt,
+    RoadmapAssignment,
     RoadmapItem,
     Roadmap,
     RoadmapPhase,
     RoadmapState,
+    StudentProfile,
     User,
+    UserRole,
 )
 from app.db.session import get_db
+from app.schemas.assignments import RoadmapAssignRequest
 from app.schemas.attempts import SubmitAttemptRequest
 from app.schemas.roadmap import NextQuestionRequest, RoadmapGenerateRequest
 from app.services.adaptive_engine import generate_next_question
@@ -47,6 +54,58 @@ def _get_roadmap_context(db: Session, roadmap_item_id: int) -> str:
     if not roadmap:
         return ""
     return _get_pdf_context(db, roadmap.pdf_id, roadmap.page_start, roadmap.page_end)
+
+
+def _get_student_targets(current_user: User) -> dict[str, list[int]]:
+    profile = current_user.student_profile
+    if not profile:
+        return {"student": [current_user.id], "class": [], "group": []}
+    return {
+        "student": [current_user.id],
+        "class": [profile.class_id] if profile.class_id else [],
+        "group": [profile.group_id] if profile.group_id else [],
+    }
+
+
+def _validate_assignment_target(db: Session, target_type: str, target_id: int) -> None:
+    if target_type == "class":
+        if not db.get(Class, target_id):
+            raise HTTPException(status_code=404, detail="Class not found")
+    elif target_type == "group":
+        if not db.get(Group, target_id):
+            raise HTTPException(status_code=404, detail="Group not found")
+    elif target_type == "student":
+        user = db.get(User, target_id)
+        if not user or user.role != UserRole.student:
+            raise HTTPException(status_code=404, detail="Student not found")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid target type")
+
+
+def _is_student_assigned(db: Session, roadmap_id: int, current_user: User) -> bool:
+    targets = _get_student_targets(current_user)
+    assignment = (
+        db.query(RoadmapAssignment)
+        .filter(
+            RoadmapAssignment.roadmap_id == roadmap_id,
+            or_(
+                and_(
+                    RoadmapAssignment.target_type == "student",
+                    RoadmapAssignment.target_id.in_(targets["student"]),
+                ),
+                and_(
+                    RoadmapAssignment.target_type == "class",
+                    RoadmapAssignment.target_id.in_(targets["class"]),
+                ),
+                and_(
+                    RoadmapAssignment.target_type == "group",
+                    RoadmapAssignment.target_id.in_(targets["group"]),
+                ),
+            ),
+        )
+        .one_or_none()
+    )
+    return assignment is not None
 
 
 @router.post("/generate")
@@ -126,3 +185,199 @@ def submit_attempt(
 
     db.commit()
     return {"status": status.value, "consecutive_failures": state.consecutive_failures}
+
+
+@router.post("/assign")
+def assign_roadmap(
+    payload: RoadmapAssignRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    roadmap = db.get(Roadmap, payload.roadmap_id)
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="Roadmap not found")
+
+    _validate_assignment_target(db, payload.target_type, payload.target_id)
+
+    db.add(
+        RoadmapAssignment(
+            roadmap_id=payload.roadmap_id,
+            target_type=payload.target_type,
+            target_id=payload.target_id,
+        )
+    )
+    db.commit()
+    return {"status": "assigned"}
+
+
+@router.get("/assigned")
+def list_assigned_roadmaps(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    targets = _get_student_targets(current_user)
+    assignments = (
+        db.query(RoadmapAssignment.roadmap_id)
+        .filter(
+            or_(
+                and_(
+                    RoadmapAssignment.target_type == "student",
+                    RoadmapAssignment.target_id.in_(targets["student"]),
+                ),
+                and_(
+                    RoadmapAssignment.target_type == "class",
+                    RoadmapAssignment.target_id.in_(targets["class"]),
+                ),
+                and_(
+                    RoadmapAssignment.target_type == "group",
+                    RoadmapAssignment.target_id.in_(targets["group"]),
+                ),
+            )
+        )
+        .subquery()
+    )
+    roadmaps = (
+        db.query(Roadmap)
+        .join(assignments, Roadmap.id == assignments.c.roadmap_id)
+        .order_by(Roadmap.created_at.desc())
+        .all()
+    )
+    return [{"id": item.id, "title": item.title} for item in roadmaps]
+
+
+@router.get("/progress")
+def student_roadmap_progress(
+    roadmap_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    if not _is_student_assigned(db, roadmap_id, current_user):
+        raise HTTPException(status_code=403, detail="Not assigned to this roadmap")
+
+    total_items = db.query(func.count(RoadmapItem.id)).filter(RoadmapItem.roadmap_id == roadmap_id).scalar()
+    if not total_items:
+        return {"roadmap_id": roadmap_id, "total_items": 0, "progress": 0}
+
+    correct_count = (
+        db.query(func.count(distinct(RoadmapAttempt.roadmap_item_id)))
+        .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+        .filter(
+            RoadmapItem.roadmap_id == roadmap_id,
+            RoadmapAttempt.student_id == current_user.id,
+            RoadmapAttempt.status == AttemptStatus.correct,
+        )
+        .scalar()
+    )
+
+    percent = int(((correct_count or 0) / total_items) * 100)
+    return {"roadmap_id": roadmap_id, "total_items": total_items, "progress": percent}
+
+
+@router.get("/admin/progress")
+def roadmap_progress(
+    roadmap_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    total_items = db.query(func.count(RoadmapItem.id)).filter(RoadmapItem.roadmap_id == roadmap_id).scalar()
+    if not total_items:
+        return {"roadmap_id": roadmap_id, "total_items": 0, "students": []}
+
+    assigned_students = set()
+
+    assignment_rows = db.query(RoadmapAssignment).filter(RoadmapAssignment.roadmap_id == roadmap_id).all()
+    for assignment in assignment_rows:
+        if assignment.target_type == "student":
+            assigned_students.add(assignment.target_id)
+        elif assignment.target_type == "class":
+            students = (
+                db.query(StudentProfile.user_id)
+                .filter(StudentProfile.class_id == assignment.target_id)
+                .all()
+            )
+            assigned_students.update(student_id for (student_id,) in students)
+        elif assignment.target_type == "group":
+            students = (
+                db.query(StudentProfile.user_id)
+                .filter(StudentProfile.group_id == assignment.target_id)
+                .all()
+            )
+            assigned_students.update(student_id for (student_id,) in students)
+
+    if not assigned_students:
+        return {"roadmap_id": roadmap_id, "total_items": total_items, "students": []}
+
+    correct_subquery = (
+        db.query(
+            RoadmapAttempt.student_id.label("student_id"),
+            func.count(distinct(RoadmapAttempt.roadmap_item_id)).label("correct_count"),
+        )
+        .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+        .filter(
+            RoadmapItem.roadmap_id == roadmap_id,
+            RoadmapAttempt.status == AttemptStatus.correct,
+            RoadmapAttempt.student_id.in_(assigned_students),
+        )
+        .group_by(RoadmapAttempt.student_id)
+        .subquery()
+    )
+
+    students = (
+        db.query(User.id, User.email, correct_subquery.c.correct_count)
+        .outerjoin(correct_subquery, User.id == correct_subquery.c.student_id)
+        .filter(User.id.in_(assigned_students))
+        .all()
+    )
+
+    payload = []
+    for student_id, email, correct_count in students:
+        completed = correct_count or 0
+        percent = int((completed / total_items) * 100)
+        payload.append({"student_id": student_id, "email": email, "progress": percent})
+
+    return {"roadmap_id": roadmap_id, "total_items": total_items, "students": payload}
+
+
+@router.get("/admin/summary")
+def roadmap_summary(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    totals = (
+        db.query(Roadmap.id, Roadmap.title, func.count(RoadmapItem.id).label("total_items"))
+        .join(RoadmapItem, RoadmapItem.roadmap_id == Roadmap.id)
+        .group_by(Roadmap.id)
+        .subquery()
+    )
+
+    correct = (
+        db.query(
+            RoadmapItem.roadmap_id.label("roadmap_id"),
+            func.count(distinct(RoadmapAttempt.roadmap_item_id)).label("correct_items"),
+        )
+        .join(RoadmapAttempt, RoadmapAttempt.roadmap_item_id == RoadmapItem.id)
+        .filter(RoadmapAttempt.status == AttemptStatus.correct)
+        .group_by(RoadmapItem.roadmap_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(totals.c.id, totals.c.title, totals.c.total_items, correct.c.correct_items)
+        .outerjoin(correct, totals.c.id == correct.c.roadmap_id)
+        .all()
+    )
+
+    response = []
+    for roadmap_id, title, total_items, correct_items in rows:
+        completed = correct_items or 0
+        percent = int((completed / total_items) * 100) if total_items else 0
+        response.append(
+            {
+                "roadmap_id": roadmap_id,
+                "title": title,
+                "total_items": total_items,
+                "completed_items": completed,
+                "progress": percent,
+            }
+        )
+    return response
