@@ -1,10 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
+from groq import APIError
 from sqlalchemy import and_, distinct, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.security import require_admin, require_student
+from app.core.security import get_current_user
 from app.db.models import (
     AttemptStatus,
+    AiQuestion,
     Class,
     PdfChunk,
     Group,
@@ -108,6 +111,40 @@ def _is_student_assigned(db: Session, roadmap_id: int, current_user: User) -> bo
     return assignment is not None
 
 
+def _serialize_question(question: AiQuestion | None) -> dict | None:
+    if not question:
+        return None
+    return {
+        "id": question.id,
+        "type": question.type_label,
+        "difficulty": question.difficulty,
+        "text": question.question_text,
+        "choices": question.choices,
+        "answer_key": question.answer_key,
+        "hint": question.hint,
+        "explanation": question.explanation,
+    }
+
+
+def _serialize_roadmap_item(db: Session, item: RoadmapItem) -> dict:
+    question = (
+        db.query(AiQuestion)
+        .filter(AiQuestion.roadmap_item_id == item.id)
+        .order_by(AiQuestion.created_at.asc())
+        .first()
+    )
+    return {
+        "id": item.id,
+        "roadmap_id": item.roadmap_id,
+        "topic": item.topic,
+        "question_type": item.question_type,
+        "difficulty": item.difficulty,
+        "sequence_index": item.sequence_index,
+        "metadata": item.metadata_,
+        "question": _serialize_question(question),
+    }
+
+
 @router.post("/generate")
 def create_roadmap(
     payload: RoadmapGenerateRequest,
@@ -118,15 +155,22 @@ def create_roadmap(
     if not chunk_context:
         raise HTTPException(status_code=400, detail="No PDF content found for selection")
 
-    roadmap_id = generate_roadmap(
-        db=db,
-        pdf_id=payload.pdf_id,
-        title=payload.title,
-        chunk_context=chunk_context,
-        created_by=current_user.id,
-        page_start=payload.page_start,
-        page_end=payload.page_end,
-    )
+    try:
+        roadmap_id = generate_roadmap(
+            db=db,
+            pdf_id=payload.pdf_id,
+            title=payload.title,
+            chunk_context=chunk_context,
+            created_by=current_user.id,
+            page_start=payload.page_start,
+            page_end=payload.page_end,
+        )
+    except APIError as error:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"Groq roadmap generation failed: {error}") from error
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Roadmap generation failed: {error}") from error
     return {"roadmap_id": roadmap_id}
 
 
@@ -164,7 +208,17 @@ def submit_attempt(
         .one_or_none()
     )
     if not state:
-        raise HTTPException(status_code=404, detail="Roadmap state not found")
+        state = RoadmapState(
+            student_id=current_user.id,
+            roadmap_item_id=payload.roadmap_item_id,
+            consecutive_failures=0,
+            phase=RoadmapPhase.A,
+            last_question_id=payload.question_id,
+        )
+        db.add(state)
+        db.flush()
+    else:
+        state.last_question_id = payload.question_id
 
     attempt_no = state.consecutive_failures + 1
     status = AttemptStatus.correct if payload.is_correct else AttemptStatus.incorrect
@@ -243,6 +297,28 @@ def list_assigned_roadmaps(
         .all()
     )
     return [{"id": item.id, "title": item.title} for item in roadmaps]
+
+
+@router.get("/{roadmap_id}/items")
+def list_roadmap_items(
+    roadmap_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    roadmap = db.get(Roadmap, roadmap_id)
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="Roadmap not found")
+
+    if current_user.role == UserRole.student and not _is_student_assigned(db, roadmap_id, current_user):
+        raise HTTPException(status_code=403, detail="Not assigned to this roadmap")
+
+    items = (
+        db.query(RoadmapItem)
+        .filter(RoadmapItem.roadmap_id == roadmap_id)
+        .order_by(RoadmapItem.sequence_index.asc())
+        .all()
+    )
+    return [_serialize_roadmap_item(db, item) for item in items]
 
 
 @router.get("/progress")

@@ -1,11 +1,14 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+
+json_type = JSON().with_variant(JSONB, "postgresql")
 
 
 class UserRole(str, enum.Enum):
@@ -118,7 +121,7 @@ class RoadmapItem(Base):
     question_type: Mapped[str] = mapped_column(String(120))
     difficulty: Mapped[str] = mapped_column(String(20))
     sequence_index: Mapped[int] = mapped_column(Integer)
-    metadata: Mapped[dict | None] = mapped_column(JSONB)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", json_type)
 
 
 class RoadmapAssignment(Base):
@@ -163,8 +166,8 @@ class AiQuestion(Base):
     type_label: Mapped[str] = mapped_column(String(120))
     difficulty: Mapped[str] = mapped_column(String(20))
     question_text: Mapped[str] = mapped_column(Text)
-    choices: Mapped[dict | None] = mapped_column(JSONB)
-    answer_key: Mapped[dict | None] = mapped_column(JSONB)
+    choices: Mapped[dict | None] = mapped_column(json_type)
+    answer_key: Mapped[dict | None] = mapped_column(json_type)
     explanation: Mapped[str | None] = mapped_column(Text)
     hint: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str] = mapped_column(String(20), default="groq")

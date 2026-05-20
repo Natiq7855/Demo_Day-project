@@ -2,10 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
-from app.db.models import StudentProfile, User, UserStatus
+from app.core.config import settings
+from app.db.models import StudentProfile, User, UserRole, UserStatus
 from app.db.session import get_db
 from app.core.security import create_access_token, get_password_hash, require_admin, verify_password
-from app.schemas.auth import ApproveUserRequest, RegisterRequest, RegisterResponse, TokenResponse
+from app.schemas.auth import ApproveUserRequest, RegisterRequest, RegisterResponse, TeacherLoginRequest, TokenResponse
 
 router = APIRouter()
 
@@ -48,6 +49,30 @@ def login(
     if user.status != UserStatus.approved:
         raise HTTPException(status_code=403, detail="Account not approved")
 
+    token = create_access_token(subject=user.email)
+    return TokenResponse(access_token=token)
+
+
+@router.post("/teacher-login", response_model=TokenResponse)
+def teacher_login(payload: TeacherLoginRequest, db: Session = Depends(get_db)):
+    if payload.email.lower() != settings.teacher_email.lower() or payload.password != settings.teacher_password:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid teacher credentials")
+
+    user = db.query(User).filter(User.email == payload.email).one_or_none()
+    if not user:
+        user = User(
+            email=payload.email,
+            password_hash=get_password_hash(payload.password),
+            role=UserRole.admin,
+            status=UserStatus.approved,
+        )
+        db.add(user)
+    else:
+        user.password_hash = get_password_hash(payload.password)
+        user.role = UserRole.admin
+        user.status = UserStatus.approved
+
+    db.commit()
     token = create_access_token(subject=user.email)
     return TokenResponse(access_token=token)
 
