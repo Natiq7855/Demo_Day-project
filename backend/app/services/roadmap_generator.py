@@ -2,7 +2,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from app.db.models import AiQuestion, Roadmap, RoadmapItem
+from app.db.models import AiQuestion, Roadmap, RoadmapItem, RoadmapSourcePdf
 from app.services.groq_client import create_json_completion
 from app.utils.json_schema import ROADMAP_SCHEMA
 
@@ -33,7 +33,7 @@ def _extract_items(payload: dict) -> list[dict]:
 
 def generate_roadmap(
     db: Session,
-    pdf_id: int,
+    pdf_ids: list[int],
     title: str,
     chunk_context: str,
     created_by: int,
@@ -44,7 +44,7 @@ def generate_roadmap(
         {
             "role": "system",
             "content": (
-                "Return only a JSON object with this exact top-level shape: "
+                "You are an AI tutor. Return only a JSON object with this exact top-level shape: "
                 '{"items":[{"topic":"...","question_type":"multiple_choice","difficulty":"easy|medium|hard",'
                 '"question_text":"...","choices":["..."],"answer_key":["..."],"hint":"...",'
                 '"explanation":"...","metadata":null}]}. Do not wrap it in another key. '
@@ -54,9 +54,11 @@ def generate_roadmap(
         {
             "role": "user",
             "content": (
-                "Analyze the context and generate a teacher-created roadmap question set. "
+                "Analyze the context and generate an AI-created roadmap question set. "
+                "Choose different question types based on the PDFs and keep every question grounded in the text. "
+                "Use all PDFs when multiple sources are provided and vary the questions across topics. "
                 "Create at least one question for every required question type, using the same topic/content style "
-                "as the PDF. Required question types: "
+                "as the PDFs. Required question types: "
                 f"{', '.join(REQUIRED_QUESTION_TYPES)}.\n"
                 f"Title: {title}\nContext: {chunk_context}"
             ),
@@ -68,15 +70,19 @@ def generate_roadmap(
     if not items:
         raise ValueError("Groq returned an empty roadmap.")
 
+    primary_pdf_id = pdf_ids[0]
     roadmap = Roadmap(
         title=title,
-        pdf_id=pdf_id,
+        pdf_id=primary_pdf_id,
         created_by=created_by,
         page_start=page_start,
         page_end=page_end,
     )
     db.add(roadmap)
     db.flush()
+
+    for pdf_id in dict.fromkeys(pdf_ids):
+        db.add(RoadmapSourcePdf(roadmap_id=roadmap.id, pdf_id=pdf_id))
 
     seen_types = {item.get("question_type") for item in items}
     for question_type in REQUIRED_QUESTION_TYPES:
@@ -118,7 +124,7 @@ def generate_roadmap(
                 answer_key=item.get("answer_key"),
                 explanation=item.get("explanation"),
                 hint=item.get("hint"),
-                source="teacher_groq",
+                source="ai_generated",
             )
         )
 

@@ -38,7 +38,15 @@ async function api(path, options = {}) {
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    throw new Error(payload.detail || payload.message || "Request failed");
+    const detail = payload && typeof payload === "object"
+      ? payload.detail || payload.message || payload.error
+      : payload;
+    const message = typeof detail === "string"
+      ? detail
+      : detail
+        ? JSON.stringify(detail)
+        : "Request failed";
+    throw new Error(message);
   }
   return payload;
 }
@@ -71,7 +79,17 @@ function escapeHtml(value) {
 }
 
 function formData(event) {
-  return Object.fromEntries(new FormData(event.target, event.submitter).entries());
+  const output = {};
+  for (const [key, value] of new FormData(event.target, event.submitter).entries()) {
+    if (output[key] === undefined) {
+      output[key] = value;
+    } else if (Array.isArray(output[key])) {
+      output[key].push(value);
+    } else {
+      output[key] = [output[key], value];
+    }
+  }
+  return output;
 }
 
 async function boot() {
@@ -361,15 +379,16 @@ function adminContent() {
         </form>
       </div>
       <div class="card">
-        <h3>Generate Questions</h3>
+        <h3>Generate AI Questions</h3>
         <form class="form" data-action="generate-roadmap">
-          <label>PDF<select name="pdf_id" required>${options(pdfs)}</select></label>
+          <label>PDFs<select name="pdf_ids" multiple required>${options(pdfs)}</select></label>
           <label>Roadmap title<input name="title" required /></label>
           <div class="grid two">
             <label>Start page<input name="page_start" type="number" min="1" /></label>
             <label>End page<input name="page_end" type="number" min="1" /></label>
           </div>
-          <button type="submit">Create question set</button>
+          <p class="muted">Tip: Select multiple PDFs to mix sources and question types.</p>
+          <button type="submit">Create AI question set</button>
         </form>
       </div>
       <div class="card">
@@ -385,6 +404,7 @@ function adminContent() {
         <form class="form" data-action="upload-exam">
           <label>Title<input name="title" required /></label>
           <label>File<input name="file" type="file" required /></label>
+          <label>Answer sheet<textarea name="answer_key" rows="6" placeholder="One answer per line" required></textarea></label>
           <button type="submit">Upload practice exam</button>
         </form>
         <hr />
@@ -430,12 +450,13 @@ function studentDashboard() {
             <strong>${escapeHtml(exam.title)}</strong>
             <div class="row" style="margin-top:10px">
               <button class="secondary" data-download-exam="${exam.id}" data-filename="${escapeHtml(exam.title)}">Download</button>
-              <form class="row" data-action="submit-exam">
-                <input type="hidden" name="practice_exam_id" value="${exam.id}" />
-                <input name="score" type="number" min="0" max="100" placeholder="Private score" required />
-                <button type="submit">Save</button>
-              </form>
             </div>
+            <p class="muted">${exam.question_count || 0} questions · ${exam.question_count ? "Answer each question below" : "Enter one answer per line"}</p>
+            <form class="form" data-action="submit-exam">
+              <input type="hidden" name="practice_exam_id" value="${exam.id}" />
+              ${examAnswerFields(exam)}
+              <button type="submit">Submit answers</button>
+            </form>
           </div>
         `).join("") : `<p class="muted">No practice exam assigned yet.</p>`}
       </div>
@@ -542,6 +563,16 @@ function roadmapSummaryTable(summary, includeActions = false) {
   ) + (state.data.progressDetails ? `<div style="margin-top:18px">${progressDetails()}</div>` : "");
 }
 
+function examAnswerFields(exam) {
+  const count = Number(exam.question_count || 0);
+  if (!count) {
+    return `<textarea name="answers" rows="5" placeholder="1) ...&#10;2) ...&#10;3) ..." required></textarea>`;
+  }
+  return Array.from({ length: count }, (_, index) => `
+    <label>Answer ${index + 1}<input name="answers" placeholder="Answer ${index + 1}" required /></label>
+  `).join("");
+}
+
 function progressDetails() {
   const details = state.data.progressDetails;
   return `
@@ -639,20 +670,18 @@ document.addEventListener("click", async (event) => {
 
   const question = event.target.closest("[data-question]");
   if (question) {
-    const item = (state.data.items || []).find((entry) => entry.id === Number(question.dataset.question));
-    state.data.question = {
-      question: item?.question || {
-        id: 0,
-        type: item?.question_type || "question",
-        difficulty: item?.difficulty || "medium",
-        text: "No saved question found for this roadmap item.",
-        choices: [],
-      },
-      hint: item?.question?.hint,
-      explanation: item?.question?.explanation,
-    };
-    state.data.activeItemId = Number(question.dataset.question);
-    render();
+    try {
+      const roadmapItemId = Number(question.dataset.question);
+      const payload = await api("/roadmaps/next-question", {
+        method: "POST",
+        body: JSON.stringify({ roadmap_item_id: roadmapItemId }),
+      });
+      state.data.question = payload;
+      state.data.activeItemId = roadmapItemId;
+      render();
+    } catch (error) {
+      setMessage("", error.message);
+    }
     return;
   }
 
@@ -722,10 +751,25 @@ document.addEventListener("submit", async (event) => {
     if (action === "create-class") await api("/users/classes", { method: "POST", body: JSON.stringify(data) });
     if (action === "create-group") await api("/users/groups", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["class_id"])) });
     if (action === "assign-student") await api("/users/assign-student", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["student_id", "class_id", "group_id"])) });
-    if (action === "generate-roadmap") await api("/roadmaps/generate", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["pdf_id", "page_start", "page_end"])) });
+    if (action === "generate-roadmap") {
+      const payload = cleanNumbers(data, ["pdf_ids", "page_start", "page_end"]);
+      if (payload.pdf_ids != null && !Array.isArray(payload.pdf_ids)) payload.pdf_ids = [payload.pdf_ids];
+      if (!payload.pdf_id && Array.isArray(payload.pdf_ids) && payload.pdf_ids.length) {
+        payload.pdf_id = payload.pdf_ids[0];
+      }
+      await api("/roadmaps/generate", { method: "POST", body: JSON.stringify(payload) });
+    }
     if (action === "assign-roadmap") await api("/roadmaps/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["roadmap_id", "target_id"])) });
     if (action === "assign-exam") await api("/practice-exams/admin/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
-    if (action === "submit-exam") await api("/practice-exams/student/submit", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "score"])) });
+    if (action === "submit-exam") {
+      const payload = cleanNumbers(data, ["practice_exam_id"]);
+      payload.answers = parseExamAnswers(data.answers);
+      const result = await api("/practice-exams/student/submit", { method: "POST", body: JSON.stringify(payload) });
+      await loadView();
+      state.message = `Score: ${result.score}% (${result.correct_count}/${result.total_questions})`;
+      render();
+      return;
+    }
 
     if (action === "upload-pdf") {
       await upload("/admin/upload-pdf", form);
@@ -748,7 +792,16 @@ document.addEventListener("submit", async (event) => {
           is_correct: data.is_correct === "true",
         }),
       });
-      state.data.question = null;
+      if (data.is_correct === "true") {
+        state.data.question = null;
+      } else {
+        const roadmapItemId = Number(data.roadmap_item_id);
+        state.data.question = await api("/roadmaps/next-question", {
+          method: "POST",
+          body: JSON.stringify({ roadmap_item_id: roadmapItemId }),
+        });
+        state.data.activeItemId = roadmapItemId;
+      }
     }
 
     await loadView();
@@ -792,9 +845,29 @@ async function downloadFile(path, fallbackName) {
 function cleanNumbers(data, keys) {
   const output = { ...data };
   keys.forEach((key) => {
-    output[key] = output[key] === "" || output[key] == null ? null : Number(output[key]);
+    if (Array.isArray(output[key])) {
+      output[key] = output[key]
+        .map((value) => (value === "" || value == null ? null : Number(value)))
+        .filter((value) => value != null);
+    } else {
+      output[key] = output[key] === "" || output[key] == null ? null : Number(output[key]);
+    }
   });
   return output;
+}
+
+function parseAnswerList(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseExamAnswers(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean);
+  }
+  return parseAnswerList(value);
 }
 
 boot();

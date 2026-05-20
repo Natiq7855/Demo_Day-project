@@ -61,6 +61,12 @@ CREATE TABLE roadmaps (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE roadmap_source_pdfs (
+    id SERIAL PRIMARY KEY,
+    roadmap_id INTEGER REFERENCES roadmaps(id),
+    pdf_id INTEGER REFERENCES pdfs(id)
+);
+
 CREATE TABLE roadmap_items (
     id SERIAL PRIMARY KEY,
     roadmap_id INTEGER REFERENCES roadmaps(id),
@@ -117,6 +123,7 @@ CREATE TABLE practice_exams (
     id SERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
     file_path VARCHAR(500) NOT NULL,
+    answer_key JSONB,
     uploaded_by INTEGER REFERENCES users(id),
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -126,6 +133,9 @@ CREATE TABLE practice_exam_attempts (
     practice_exam_id INTEGER REFERENCES practice_exams(id),
     student_id INTEGER REFERENCES users(id),
     score INTEGER NOT NULL,
+    answers JSONB,
+    correct_count INTEGER,
+    total_questions INTEGER,
     submitted_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 

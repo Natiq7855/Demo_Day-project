@@ -9,6 +9,7 @@ from app.db.models import (
     AttemptStatus,
     AiQuestion,
     Class,
+    Pdf,
     PdfChunk,
     Group,
     RoadmapAttempt,
@@ -16,6 +17,7 @@ from app.db.models import (
     RoadmapItem,
     Roadmap,
     RoadmapPhase,
+    RoadmapSourcePdf,
     RoadmapState,
     StudentProfile,
     User,
@@ -47,6 +49,28 @@ def _get_pdf_context(
     return "\n".join(chunk.content_text for chunk in chunks)
 
 
+def _get_pdfs_context(
+    db: Session,
+    pdf_ids: list[int],
+    page_start: int | None,
+    page_end: int | None,
+) -> str:
+    if not pdf_ids:
+        return ""
+    pdfs = db.query(Pdf).filter(Pdf.id.in_(pdf_ids)).all()
+    pdf_map = {pdf.id: pdf for pdf in pdfs}
+    missing = [pdf_id for pdf_id in pdf_ids if pdf_id not in pdf_map]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"PDFs not found: {', '.join(map(str, missing))}")
+    sections = []
+    for pdf_id in dict.fromkeys(pdf_ids):
+        context = _get_pdf_context(db, pdf_id, page_start, page_end)
+        if context:
+            title = pdf_map[pdf_id].title
+            sections.append(f"PDF: {title}\n{context}")
+    return "\n\n".join(sections)
+
+
 def _get_roadmap_context(db: Session, roadmap_item_id: int) -> str:
     roadmap = (
         db.query(Roadmap)
@@ -56,7 +80,13 @@ def _get_roadmap_context(db: Session, roadmap_item_id: int) -> str:
     )
     if not roadmap:
         return ""
-    return _get_pdf_context(db, roadmap.pdf_id, roadmap.page_start, roadmap.page_end)
+    source_rows = (
+        db.query(RoadmapSourcePdf.pdf_id)
+        .filter(RoadmapSourcePdf.roadmap_id == roadmap.id)
+        .all()
+    )
+    pdf_ids = [pdf_id for (pdf_id,) in source_rows] if source_rows else [roadmap.pdf_id]
+    return _get_pdfs_context(db, pdf_ids, roadmap.page_start, roadmap.page_end)
 
 
 def _get_student_targets(current_user: User) -> dict[str, list[int]]:
@@ -151,14 +181,19 @@ def create_roadmap(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    chunk_context = _get_pdf_context(db, payload.pdf_id, payload.page_start, payload.page_end)
+    pdf_ids = payload.pdf_ids or ([payload.pdf_id] if payload.pdf_id else [])
+    pdf_ids = [pdf_id for pdf_id in pdf_ids if pdf_id is not None]
+    if not pdf_ids:
+        raise HTTPException(status_code=400, detail="Select at least one PDF")
+
+    chunk_context = _get_pdfs_context(db, pdf_ids, payload.page_start, payload.page_end)
     if not chunk_context:
         raise HTTPException(status_code=400, detail="No PDF content found for selection")
 
     try:
         roadmap_id = generate_roadmap(
             db=db,
-            pdf_id=payload.pdf_id,
+            pdf_ids=pdf_ids,
             title=payload.title,
             chunk_context=chunk_context,
             created_by=current_user.id,

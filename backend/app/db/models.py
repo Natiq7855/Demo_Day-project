@@ -112,6 +112,14 @@ class Roadmap(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class RoadmapSourcePdf(Base):
+    __tablename__ = "roadmap_source_pdfs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    roadmap_id: Mapped[int] = mapped_column(ForeignKey("roadmaps.id"))
+    pdf_id: Mapped[int] = mapped_column(ForeignKey("pdfs.id"))
+
+
 class RoadmapItem(Base):
     __tablename__ = "roadmap_items"
 
@@ -180,6 +188,7 @@ class PracticeExam(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(255))
     file_path: Mapped[str] = mapped_column(String(500))
+    answer_key: Mapped[list[str] | None] = mapped_column(json_type)
     uploaded_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -191,6 +200,9 @@ class PracticeExamAttempt(Base):
     practice_exam_id: Mapped[int] = mapped_column(ForeignKey("practice_exams.id"))
     student_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     score: Mapped[int] = mapped_column(Integer)
+    answers: Mapped[list[str] | None] = mapped_column(json_type)
+    correct_count: Mapped[int | None] = mapped_column(Integer)
+    total_questions: Mapped[int | None] = mapped_column(Integer)
     submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
