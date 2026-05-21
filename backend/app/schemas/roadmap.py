@@ -1,22 +1,23 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
-class PdfSelection(BaseModel):
-    pdf_id: int
-    page_start: int | None = None
-    page_end: int | None = None
+class RoadmapQuestionCreate(BaseModel):
+    question_text: str | None = None
+    media_type: str | None = None
+    media_path: str | None = None
+    choices: list[str]
+    answer_key: str
 
 
-class RoadmapGenerateRequest(BaseModel):
-    pdf_id: int | None = Field(default=None)
-    pdf_ids: list[int] | None = Field(default=None)
-    pdf_selections: list[PdfSelection] | None = None
+class MiniRoadmapCreate(BaseModel):
     title: str
-    chapter: str | None = None
-    page_start: int | None = None
-    page_end: int | None = None
+    questions: list[RoadmapQuestionCreate]
+
+
+class RoadmapCreateRequest(BaseModel):
+    title: str
+    minis: list[MiniRoadmapCreate]
 
 
 class NextQuestionRequest(BaseModel):
     mini_roadmap_id: int
-    roadmap_item_id: int | None = None

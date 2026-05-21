@@ -18,6 +18,7 @@ app.add_middleware(
         "http://127.0.0.1:5501",
         "http://localhost:5501",
     ],
+    allow_origin_regex=r"http://(127\.0\.0\.1|localhost)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,6 +69,23 @@ def prepare_dev_database():
                 connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN mini_roadmap_id INTEGER"))
             if "order_in_mini" not in item_columns:
                 connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN order_in_mini INTEGER"))
+            if "question_text" not in item_columns:
+                connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN question_text TEXT"))
+            if "media_type" not in item_columns:
+                connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN media_type TEXT"))
+            if "media_path" not in item_columns:
+                connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN media_path TEXT"))
+            if "choices" not in item_columns:
+                connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN choices TEXT"))
+            if "answer_key" not in item_columns:
+                connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN answer_key TEXT"))
+
+            mini_columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(roadmap_minis)"))
+            }
+            if "title" not in mini_columns:
+                connection.execute(text("ALTER TABLE roadmap_minis ADD COLUMN title TEXT"))
 
             attempt_columns = {
                 row[1]

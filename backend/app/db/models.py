@@ -105,7 +105,7 @@ class Roadmap(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(255))
-    pdf_id: Mapped[int] = mapped_column(ForeignKey("pdfs.id"))
+    pdf_id: Mapped[int | None] = mapped_column(ForeignKey("pdfs.id"))
     page_start: Mapped[int | None] = mapped_column(Integer)
     page_end: Mapped[int | None] = mapped_column(Integer)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
@@ -117,6 +117,7 @@ class RoadmapMini(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     roadmap_id: Mapped[int] = mapped_column(ForeignKey("roadmaps.id"))
+    title: Mapped[str | None] = mapped_column(String(255))
     question_type: Mapped[str] = mapped_column(String(120))
     sequence_index: Mapped[int] = mapped_column(Integer)
 
@@ -142,6 +143,11 @@ class RoadmapItem(Base):
     difficulty: Mapped[str] = mapped_column(String(20))
     sequence_index: Mapped[int] = mapped_column(Integer)
     order_in_mini: Mapped[int | None] = mapped_column(Integer)
+    question_text: Mapped[str | None] = mapped_column(Text)
+    media_type: Mapped[str | None] = mapped_column(String(20))
+    media_path: Mapped[str | None] = mapped_column(String(500))
+    choices: Mapped[list[str] | None] = mapped_column(json_type)
+    answer_key: Mapped[str | None] = mapped_column(String(255))
     metadata_: Mapped[dict | None] = mapped_column("metadata", json_type)
 
 

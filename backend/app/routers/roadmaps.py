@@ -1,25 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException
-from groq import APIError
+import shutil
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import and_, distinct, func, or_
 from sqlalchemy.orm import Session
 
-from app.core.security import require_admin, require_student
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_admin, require_student
 from app.db.models import (
     AttemptStatus,
-    AiQuestion,
     Class,
-    Pdf,
-    PdfChunk,
     Group,
-    RoadmapAttempt,
+    Roadmap,
     RoadmapAssignment,
+    RoadmapAttempt,
     RoadmapItem,
     RoadmapMini,
-    Roadmap,
-    RoadmapPhase,
-    RoadmapSourcePdf,
-    RoadmapState,
     StudentProfile,
     User,
     UserRole,
@@ -27,118 +24,16 @@ from app.db.models import (
 from app.db.session import get_db
 from app.schemas.assignments import RoadmapAssignRequest
 from app.schemas.attempts import SubmitAttemptRequest
-from app.schemas.roadmap import NextQuestionRequest, RoadmapGenerateRequest
-from app.services.adaptive_engine import generate_next_question
-from app.services.roadmap_generator import generate_roadmap
+from app.schemas.roadmap import NextQuestionRequest, RoadmapCreateRequest
 
 router = APIRouter()
+
+UPLOAD_ROOT = Path(__file__).resolve().parents[2] / "uploads" / "roadmaps"
+ALLOWED_MEDIA_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp", "image/gif"}
 
 
 def _normalize_answer(value: str) -> str:
     return " ".join(str(value or "").strip().lower().split())
-
-
-def _get_pdf_context(
-    db: Session,
-    pdf_id: int,
-    page_start: int | None,
-    page_end: int | None,
-) -> str:
-    query = db.query(PdfChunk).filter(PdfChunk.pdf_id == pdf_id)
-    if page_start is not None and page_end is not None:
-        query = query.filter(
-            PdfChunk.page_end >= page_start,
-            PdfChunk.page_start <= page_end,
-        )
-    chunks = query.order_by(PdfChunk.chunk_index).all()
-    return "\n".join(chunk.content_text for chunk in chunks)
-
-
-def _get_pdfs_context(
-    db: Session,
-    pdf_ids: list[int],
-    page_start: int | None,
-    page_end: int | None,
-) -> str:
-    if not pdf_ids:
-        return ""
-    pdfs = db.query(Pdf).filter(Pdf.id.in_(pdf_ids)).all()
-    pdf_map = {pdf.id: pdf for pdf in pdfs}
-    missing = [pdf_id for pdf_id in pdf_ids if pdf_id not in pdf_map]
-    if missing:
-        raise HTTPException(status_code=404, detail=f"PDFs not found: {', '.join(map(str, missing))}")
-    sections = []
-    for pdf_id in dict.fromkeys(pdf_ids):
-        context = _get_pdf_context(db, pdf_id, page_start, page_end)
-        if context:
-            title = pdf_map[pdf_id].title
-            sections.append(f"PDF: {title}\n{context}")
-    return "\n\n".join(sections)
-
-
-def _get_pdfs_context_from_selections(db: Session, selections: list[dict]) -> str:
-    if not selections:
-        return ""
-    pdf_ids = [selection["pdf_id"] for selection in selections]
-    pdfs = db.query(Pdf).filter(Pdf.id.in_(pdf_ids)).all()
-    pdf_map = {pdf.id: pdf for pdf in pdfs}
-    missing = [pdf_id for pdf_id in pdf_ids if pdf_id not in pdf_map]
-    if missing:
-        raise HTTPException(status_code=404, detail=f"PDFs not found: {', '.join(map(str, missing))}")
-    sections = []
-    for selection in selections:
-        pdf_id = selection["pdf_id"]
-        context = _get_pdf_context(db, pdf_id, selection.get("page_start"), selection.get("page_end"))
-        if context:
-            title = pdf_map[pdf_id].title
-            sections.append(f"PDF: {title}\n{context}")
-    return "\n\n".join(sections)
-
-
-def _get_roadmap_context(db: Session, roadmap_item_id: int) -> str:
-    roadmap = (
-        db.query(Roadmap)
-        .join(RoadmapItem, RoadmapItem.roadmap_id == Roadmap.id)
-        .filter(RoadmapItem.id == roadmap_item_id)
-        .one_or_none()
-    )
-    if not roadmap:
-        return ""
-    source_rows = (
-        db.query(RoadmapSourcePdf)
-        .filter(RoadmapSourcePdf.roadmap_id == roadmap.id)
-        .all()
-    )
-    if source_rows:
-        selections = [
-            {"pdf_id": row.pdf_id, "page_start": row.page_start, "page_end": row.page_end}
-            for row in source_rows
-        ]
-        return _get_pdfs_context_from_selections(db, selections)
-    return _get_pdfs_context(db, [roadmap.pdf_id], roadmap.page_start, roadmap.page_end)
-
-
-def _get_mini_roadmap_context(db: Session, mini_roadmap_id: int) -> str:
-    roadmap = (
-        db.query(Roadmap)
-        .join(RoadmapMini, RoadmapMini.roadmap_id == Roadmap.id)
-        .filter(RoadmapMini.id == mini_roadmap_id)
-        .one_or_none()
-    )
-    if not roadmap:
-        return ""
-    source_rows = (
-        db.query(RoadmapSourcePdf)
-        .filter(RoadmapSourcePdf.roadmap_id == roadmap.id)
-        .all()
-    )
-    if source_rows:
-        selections = [
-            {"pdf_id": row.pdf_id, "page_start": row.page_start, "page_end": row.page_end}
-            for row in source_rows
-        ]
-        return _get_pdfs_context_from_selections(db, selections)
-    return _get_pdfs_context(db, [roadmap.pdf_id], roadmap.page_start, roadmap.page_end)
 
 
 def _get_student_targets(current_user: User) -> dict[str, list[int]]:
@@ -193,37 +88,18 @@ def _is_student_assigned(db: Session, roadmap_id: int, current_user: User) -> bo
     return assignment is not None
 
 
-def _serialize_question(question: AiQuestion | None) -> dict | None:
-    if not question:
-        return None
-    return {
-        "id": question.id,
-        "type": question.type_label,
-        "difficulty": question.difficulty,
-        "text": question.question_text,
-        "choices": question.choices,
-        "answer_key": question.answer_key,
-        "hint": question.hint,
-        "explanation": question.explanation,
-    }
-
-
-def _serialize_roadmap_item(db: Session, item: RoadmapItem) -> dict:
-    question = (
-        db.query(AiQuestion)
-        .filter(AiQuestion.roadmap_item_id == item.id)
-        .order_by(AiQuestion.created_at.asc())
-        .first()
-    )
+def _serialize_roadmap_item(item: RoadmapItem) -> dict:
     return {
         "id": item.id,
         "roadmap_id": item.roadmap_id,
+        "mini_roadmap_id": item.mini_roadmap_id,
+        "order_in_mini": item.order_in_mini,
         "topic": item.topic,
-        "question_type": item.question_type,
-        "difficulty": item.difficulty,
         "sequence_index": item.sequence_index,
-        "metadata": item.metadata_,
-        "question": _serialize_question(question),
+        "question_text": item.question_text,
+        "media_type": item.media_type,
+        "media_path": item.media_path,
+        "choices": item.choices or [],
     }
 
 
@@ -231,53 +107,129 @@ def _serialize_mini_roadmap(mini: RoadmapMini) -> dict:
     return {
         "id": mini.id,
         "roadmap_id": mini.roadmap_id,
-        "question_type": mini.question_type,
+        "title": mini.title or mini.question_type,
         "sequence_index": mini.sequence_index,
     }
 
 
-@router.post("/generate")
+def _ensure_upload_dir() -> Path:
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    return UPLOAD_ROOT
+
+
+def _normalize_choice(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _match_choice(answer: str, choices: list[str]) -> str | None:
+    normalized_answer = _normalize_choice(answer)
+    for choice in choices:
+        if _normalize_choice(choice) == normalized_answer:
+            return choice
+    return None
+
+
+@router.post("/admin/upload")
+def upload_roadmap_media(
+    file: UploadFile = File(...),
+    _: User = Depends(require_admin),
+):
+    if file.content_type not in ALLOWED_MEDIA_TYPES:
+        raise HTTPException(status_code=400, detail="Only images or PDF files are allowed")
+
+    upload_dir = _ensure_upload_dir()
+    suffix = Path(file.filename or "").suffix
+    filename = f"{uuid4().hex}{suffix}"
+    destination = upload_dir / filename
+
+    with destination.open("wb") as output:
+        shutil.copyfileobj(file.file, output)
+
+    media_type = "image" if file.content_type.startswith("image/") else "pdf"
+    return {"media_path": filename, "media_type": media_type}
+
+
+@router.get("/media/{filename}")
+def get_roadmap_media(
+    filename: str,
+    _: User = Depends(get_current_user),
+):
+    file_path = _ensure_upload_dir() / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
+
+
+@router.post("/admin/create")
 def create_roadmap(
-    payload: RoadmapGenerateRequest,
+    payload: RoadmapCreateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    selections = []
-    if payload.pdf_selections:
-        selections = [selection.model_dump() for selection in payload.pdf_selections]
-    pdf_ids = payload.pdf_ids or ([payload.pdf_id] if payload.pdf_id else [])
-    pdf_ids = [pdf_id for pdf_id in pdf_ids if pdf_id is not None]
-    if selections:
-        pdf_ids = [selection["pdf_id"] for selection in selections]
-    if not pdf_ids:
-        raise HTTPException(status_code=400, detail="Select at least one PDF")
+    if not payload.title.strip():
+        raise HTTPException(status_code=400, detail="Roadmap title is required")
+    if not payload.minis:
+        raise HTTPException(status_code=400, detail="Add at least one mini roadmap")
 
-    chunk_context = (
-        _get_pdfs_context_from_selections(db, selections)
-        if selections
-        else _get_pdfs_context(db, pdf_ids, payload.page_start, payload.page_end)
+    roadmap = Roadmap(
+        title=payload.title.strip(),
+        pdf_id=None,
+        created_by=current_user.id,
     )
-    if not chunk_context:
-        raise HTTPException(status_code=400, detail="No PDF content found for selection")
+    db.add(roadmap)
+    db.flush()
 
-    try:
-        roadmap_id = generate_roadmap(
-            db=db,
-            pdf_ids=pdf_ids,
-            title=payload.title,
-            chunk_context=chunk_context,
-            created_by=current_user.id,
-            page_start=payload.page_start,
-            page_end=payload.page_end,
-            pdf_selections=selections,
+    for mini_index, mini in enumerate(payload.minis, start=1):
+        if not mini.title.strip():
+            raise HTTPException(status_code=400, detail="Mini roadmap title is required")
+        if not mini.questions:
+            raise HTTPException(status_code=400, detail="Each mini roadmap needs questions")
+
+        roadmap_mini = RoadmapMini(
+            roadmap_id=roadmap.id,
+            title=mini.title.strip(),
+            question_type="manual",
+            sequence_index=mini_index,
         )
-    except APIError as error:
-        db.rollback()
-        raise HTTPException(status_code=502, detail=f"Groq roadmap generation failed: {error}") from error
-    except Exception as error:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Roadmap generation failed: {error}") from error
-    return {"roadmap_id": roadmap_id}
+        db.add(roadmap_mini)
+        db.flush()
+
+        for question_index, question in enumerate(mini.questions, start=1):
+            has_text = bool(question.question_text and question.question_text.strip())
+            has_media = bool(question.media_path)
+            if has_text == has_media:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each question must have either text or a media file",
+                )
+            choices = [choice.strip() for choice in question.choices if choice.strip()]
+            if len(choices) < 2:
+                raise HTTPException(status_code=400, detail="Each question needs at least 2 choices")
+            matched_answer = _match_choice(question.answer_key, choices)
+            if not matched_answer:
+                raise HTTPException(status_code=400, detail="Answer key must match one of the choices")
+            if has_media and question.media_type not in {"image", "pdf"}:
+                raise HTTPException(status_code=400, detail="Media type must be image or pdf")
+
+            db.add(
+                RoadmapItem(
+                    roadmap_id=roadmap.id,
+                    mini_roadmap_id=roadmap_mini.id,
+                    topic=mini.title.strip(),
+                    question_type="manual",
+                    difficulty="manual",
+                    sequence_index=mini_index,
+                    order_in_mini=question_index,
+                    question_text=question.question_text.strip() if has_text else None,
+                    media_type=question.media_type if has_media else None,
+                    media_path=question.media_path if has_media else None,
+                    choices=choices,
+                    answer_key=matched_answer,
+                )
+            )
+
+    db.commit()
+    return {"roadmap_id": roadmap.id}
 
 
 @router.post("/next-question")
@@ -286,18 +238,35 @@ def next_question(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
-    response = generate_next_question(
-        db=db,
-        student_id=current_user.id,
-        roadmap_item_id=payload.roadmap_item_id,
-        mini_roadmap_id=payload.mini_roadmap_id,
-        chunk_context=(
-            _get_mini_roadmap_context(db, payload.mini_roadmap_id)
-            if payload.mini_roadmap_id
-            else _get_roadmap_context(db, payload.roadmap_item_id or 0)
-        ),
+    mini = db.get(RoadmapMini, payload.mini_roadmap_id)
+    if not mini:
+        raise HTTPException(status_code=404, detail="Mini roadmap not found")
+
+    items = (
+        db.query(RoadmapItem)
+        .filter(RoadmapItem.mini_roadmap_id == payload.mini_roadmap_id)
+        .order_by(RoadmapItem.order_in_mini.asc())
+        .all()
     )
-    return response
+    if not items:
+        raise HTTPException(status_code=404, detail="No questions available")
+
+    correct_item_ids = {
+        attempt.roadmap_item_id
+        for attempt in db.query(RoadmapAttempt)
+        .filter(
+            RoadmapAttempt.student_id == current_user.id,
+            RoadmapAttempt.mini_roadmap_id == payload.mini_roadmap_id,
+            RoadmapAttempt.status == AttemptStatus.correct,
+        )
+        .all()
+    }
+
+    for item in items:
+        if item.id not in correct_item_ids:
+            return {"item": _serialize_roadmap_item(item)}
+
+    return {"completed": True}
 
 
 @router.post("/submit")
@@ -306,84 +275,57 @@ def submit_attempt(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
-    item = None
-    if payload.roadmap_item_id:
-        item = db.get(RoadmapItem, payload.roadmap_item_id)
-    if not item and payload.question_id:
-        question = db.get(AiQuestion, payload.question_id)
-        if question:
-            item = db.get(RoadmapItem, question.roadmap_item_id)
+    item = db.get(RoadmapItem, payload.roadmap_item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Roadmap item not found")
 
-    state_query = db.query(RoadmapState).filter(RoadmapState.student_id == current_user.id)
-    if payload.mini_roadmap_id:
-        state_query = state_query.filter(RoadmapState.mini_roadmap_id == payload.mini_roadmap_id)
-    else:
-        state_query = state_query.filter(RoadmapState.roadmap_item_id == item.id)
-    state = state_query.one_or_none()
-    if not state:
-        state = RoadmapState(
-            student_id=current_user.id,
-            roadmap_item_id=item.id,
-            mini_roadmap_id=payload.mini_roadmap_id,
-            consecutive_failures=0,
-            phase=RoadmapPhase.A,
-            last_question_id=payload.question_id,
-        )
-        db.add(state)
-        db.flush()
-    else:
-        state.last_question_id = payload.question_id
+    if not _is_student_assigned(db, item.roadmap_id, current_user):
+        raise HTTPException(status_code=403, detail="Not assigned to this roadmap")
 
-    attempt_no = state.consecutive_failures + 1
-    is_correct = payload.is_correct
-    if payload.selected_answer is not None:
-        question = db.get(AiQuestion, payload.question_id)
-        if not question:
-            raise HTTPException(status_code=404, detail="Question not found")
-        expected = question.answer_key or []
-        normalized_expected = {_normalize_answer(value) for value in expected}
-        selected = _normalize_answer(payload.selected_answer)
-        if not normalized_expected:
-            raise HTTPException(status_code=400, detail="Answer key not available for this question")
-        if selected in normalized_expected:
+    if payload.mini_roadmap_id and item.mini_roadmap_id != payload.mini_roadmap_id:
+        raise HTTPException(status_code=400, detail="Question does not belong to this mini roadmap")
+
+    choices = item.choices or []
+    if not choices:
+        raise HTTPException(status_code=400, detail="No choices available for this question")
+    if not item.answer_key:
+        raise HTTPException(status_code=400, detail="Answer key is missing")
+
+    selected = _normalize_answer(payload.selected_answer)
+    expected = _normalize_answer(item.answer_key)
+    is_correct = selected == expected
+    if not is_correct and payload.selected_answer and payload.selected_answer.isalpha() and len(payload.selected_answer) == 1:
+        index = ord(payload.selected_answer.upper()) - ord("A")
+        if 0 <= index < len(choices):
+            is_correct = _normalize_answer(choices[index]) == expected
+    if not is_correct:
+        matched_choice = _match_choice(payload.selected_answer, choices)
+        if matched_choice and _normalize_answer(matched_choice) == expected:
             is_correct = True
-        else:
-            choices = question.choices or []
-            if selected and selected.isalpha() and len(selected) == 1:
-                index = ord(selected.upper()) - ord("A")
-                if 0 <= index < len(choices):
-                    choice_value = choices[index]
-                    if _normalize_answer(choice_value) in normalized_expected:
-                        is_correct = True
 
-    if is_correct is None:
-        raise HTTPException(status_code=400, detail="Answer selection is required")
+    attempt_no = (
+        db.query(func.count(RoadmapAttempt.id))
+        .filter(
+            RoadmapAttempt.student_id == current_user.id,
+            RoadmapAttempt.roadmap_item_id == item.id,
+        )
+        .scalar()
+        or 0
+    ) + 1
 
     status = AttemptStatus.correct if is_correct else AttemptStatus.incorrect
     db.add(
         RoadmapAttempt(
             student_id=current_user.id,
             roadmap_item_id=item.id,
-            mini_roadmap_id=payload.mini_roadmap_id,
+            mini_roadmap_id=item.mini_roadmap_id,
             attempt_no=attempt_no,
             status=status,
         )
     )
 
-    if is_correct:
-        state.consecutive_failures = 0
-        state.phase = RoadmapPhase.A
-    else:
-        state.consecutive_failures += 1
-
     db.commit()
-    return {
-        "status": status.value,
-        "consecutive_failures": state.consecutive_failures,
-        "is_correct": is_correct,
-    }
+    return {"status": status.value, "is_correct": is_correct}
 
 
 @router.post("/assign")
@@ -472,7 +414,7 @@ def list_roadmap_items(
         .order_by(RoadmapItem.sequence_index.asc())
         .all()
     )
-    return [_serialize_roadmap_item(db, item) for item in items]
+    return [_serialize_roadmap_item(item) for item in items]
 
 
 @router.get("/progress")

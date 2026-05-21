@@ -2,7 +2,8 @@ if (window.location.protocol === "file:") {
   window.location.href = `http://127.0.0.1:5501/${window.location.pathname.split(/[\\/]/).pop() || "index.html"}`;
 }
 
-let API_BASE = localStorage.getItem("curricula_api_base") || "http://127.0.0.1:8010";
+const API_BASE = "http://127.0.0.1:8000";
+localStorage.setItem("curricula_api_base", API_BASE);
 const pageName = window.location.pathname.split("/").pop();
 const state = {
   token: localStorage.getItem("curricula_token") || "",
@@ -146,15 +147,14 @@ async function loadAdmin() {
     state.data = { students, pending, classes, groups };
   }
   if (state.view === "content") {
-    const [pdfs, summary, classes, groups, students, exams] = await Promise.all([
-      api("/admin/pdfs"),
+    const [summary, classes, groups, students, exams] = await Promise.all([
       api("/roadmaps/admin/summary"),
       api("/users/classes"),
       api("/users/groups"),
       api("/admin/students"),
       api("/practice-exams/admin/list"),
     ]);
-    state.data = { pdfs, summary, classes, groups, students, exams };
+    state.data = { summary, classes, groups, students, exams };
   }
   if (state.view === "analytics") {
     const summary = await api("/roadmaps/admin/summary");
@@ -189,7 +189,7 @@ function renderAuth() {
         <div>
           <div class="brand"><span class="brand-mark">CA</span> Curricula AI</div>
           <h1>Adaptive learning for every classroom.</h1>
-          <p>Manage approvals, upload learning material, generate Groq-powered roadmaps, and give students a focused practice workspace.</p>
+          <p>Manage approvals, build teacher-made roadmaps, and give students a focused practice workspace.</p>
         </div>
       </section>
       <section class="auth-panel">
@@ -367,30 +367,19 @@ function adminStudents() {
 }
 
 function adminContent() {
-  const { pdfs = [], summary = [], classes = [], groups = [], students = [], exams = [] } = state.data;
+  const { summary = [], classes = [], groups = [], students = [], exams = [] } = state.data;
   return `
     <div class="section-title"><h2>Content Studio</h2><button data-refresh>Refresh</button></div>
     <div class="grid two">
       <div class="card">
-        <h3>Upload PDF</h3>
-        <form class="form" data-action="upload-pdf">
-          <label>Title<input name="title" required /></label>
-          <label>Chapter<input name="chapter" /></label>
-          <label>PDF<input name="file" type="file" accept="application/pdf" required /></label>
-          <button type="submit">Upload material</button>
-        </form>
-      </div>
-      <div class="card">
-        <h3>Generate AI Questions</h3>
-        <form class="form" data-action="generate-roadmap">
-          <label>PDF selections</label>
-          <div class="pdf-selection" data-pdf-selection>
-            ${pdfSelectionRow(pdfs)}
+        <h3>Create Roadmap</h3>
+        <form class="form" data-action="create-roadmap-manual">
+          <label>Roadmap title<input name="roadmap_title" required /></label>
+          <div class="mini-wrap" data-mini-container>
+            ${manualMiniMarkup()}
           </div>
-          <button type="button" class="secondary" data-add-pdf>Add PDF</button>
-          <label>Roadmap title<input name="title" required /></label>
-          <p class="muted">Tip: Select multiple PDFs to mix sources and question types.</p>
-          <button type="submit">Create AI question set</button>
+          <button type="button" class="secondary" data-add-mini>Add mini roadmap</button>
+          <button type="submit">Create roadmap</button>
         </form>
       </div>
       <div class="card">
@@ -653,6 +642,30 @@ function pdfSelectionRow(pdfs) {
   `;
 }
 
+function manualMiniMarkup() {
+  return `
+    <div class="mini" data-mini>
+      <label>Mini title<input name="mini_title" required /></label>
+      <div class="questions" data-questions>
+        ${manualQuestionRow()}
+      </div>
+      <button type="button" class="secondary" data-add-question>Add question</button>
+    </div>
+  `;
+}
+
+function manualQuestionRow() {
+  return `
+    <div class="question-row" data-question>
+      <label>Question text<textarea name="question_text"></textarea></label>
+      <label>Or upload media<input name="media" type="file" accept="image/*,application/pdf" /></label>
+      <label>Choices<textarea name="choices" placeholder="One choice per line" required></textarea></label>
+      <label>Answer key<input name="answer_key" required /></label>
+      <button type="button" class="secondary" data-remove-question>Remove</button>
+    </div>
+  `;
+}
+
 function targetControls(classes, groups, students) {
   return `
     <label>Target type
@@ -746,6 +759,27 @@ document.addEventListener("click", async (event) => {
     } catch (error) {
       setMessage("", error.message);
     }
+    return;
+  }
+
+  const addMini = event.target.closest("[data-add-mini]");
+  if (addMini) {
+    const container = document.querySelector("[data-mini-container]");
+    if (container) container.insertAdjacentHTML("beforeend", manualMiniMarkup());
+    return;
+  }
+
+  const addQuestion = event.target.closest("[data-add-question]");
+  if (addQuestion) {
+    const questions = addQuestion.closest("[data-mini]")?.querySelector("[data-questions]");
+    if (questions) questions.insertAdjacentHTML("beforeend", manualQuestionRow());
+    return;
+  }
+
+  const removeQuestion = event.target.closest("[data-remove-question]");
+  if (removeQuestion) {
+    const row = removeQuestion.closest("[data-question]");
+    if (row) row.remove();
     return;
   }
 
@@ -847,6 +881,35 @@ document.addEventListener("submit", async (event) => {
       } finally {
         state.loading = false;
       }
+    }
+    if (action === "create-roadmap-manual") {
+      const payload = { title: data.roadmap_title, minis: [] };
+      const minis = Array.from(form.querySelectorAll("[data-mini]") || []);
+      for (const miniEl of minis) {
+        const miniTitle = miniEl.querySelector("input[name=mini_title]").value;
+        const questions = [];
+        for (const qEl of miniEl.querySelectorAll("[data-question]")) {
+          const text = qEl.querySelector("textarea[name=question_text]")?.value || "";
+          const fileInput = qEl.querySelector("input[name=media]");
+          let media = null;
+          if (fileInput && fileInput.files && fileInput.files.length) {
+            const file = fileInput.files[0];
+            const formData = new FormData();
+            formData.append("file", file);
+            const uploadResult = await api("/roadmaps/admin/upload", { method: "POST", body: formData });
+            media = uploadResult;
+          }
+          const choices = (qEl.querySelector("textarea[name=choices]")?.value || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+          const answer_key = qEl.querySelector("input[name=answer_key]")?.value || "";
+          questions.push({ question_text: text || null, media_type: media?.media_type || null, media_path: media?.media_path || null, choices, answer_key });
+        }
+        payload.minis.push({ title: miniTitle, questions });
+      }
+      await api("/roadmaps/admin/create", { method: "POST", body: JSON.stringify(payload) });
+      await loadView();
+      state.message = "Roadmap created.";
+      render();
+      return;
     }
     if (action === "assign-roadmap") await api("/roadmaps/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["roadmap_id", "target_id"])) });
     if (action === "assign-exam") await api("/practice-exams/admin/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
