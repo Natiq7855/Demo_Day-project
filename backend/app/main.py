@@ -9,6 +9,7 @@ from app.routers import admin, auth, practice_exams, roadmaps, users
 
 app = FastAPI(title="Curricula AI API")
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
