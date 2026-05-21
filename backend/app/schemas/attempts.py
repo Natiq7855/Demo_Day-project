@@ -2,6 +2,6 @@ from pydantic import BaseModel
 
 
 class SubmitAttemptRequest(BaseModel):
+    mini_roadmap_id: int | None = None
     roadmap_item_id: int
-    question_id: int
-    is_correct: bool
+    selected_answer: str

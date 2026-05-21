@@ -3,7 +3,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.db.models import AiQuestion, RoadmapItem, RoadmapPhase, RoadmapState
+from app.db.models import AiQuestion, RoadmapItem, RoadmapMini, RoadmapPhase, RoadmapState
 from app.services.groq_client import create_json_completion
 from app.utils.json_schema import QUESTION_SCHEMA
 
@@ -41,30 +41,90 @@ def _build_messages(roadmap_item: RoadmapItem, phase: RoadmapPhase, chunk_contex
     ]
 
 
-def generate_next_question(db: Session, student_id: int, roadmap_item_id: int, chunk_context: str):
-    roadmap_item = db.get(RoadmapItem, roadmap_item_id)
+def _serialize_ai_question(question: AiQuestion, hint: str | None, explanation: str | None) -> dict:
+    return {
+        "question": {
+            "id": question.id,
+            "type": question.type_label,
+            "text": question.question_text,
+            "choices": question.choices or [],
+            "answer_key": question.answer_key,
+            "difficulty": question.difficulty,
+        },
+        "hint": hint,
+        "explanation": explanation,
+    }
+
+
+def generate_next_question(
+    db: Session,
+    student_id: int,
+    roadmap_item_id: int | None,
+    mini_roadmap_id: int | None,
+    chunk_context: str,
+):
+    roadmap_item = db.get(RoadmapItem, roadmap_item_id) if roadmap_item_id else None
+    if mini_roadmap_id:
+        roadmap_mini = db.get(RoadmapMini, mini_roadmap_id)
+        if not roadmap_mini:
+            raise ValueError("Mini roadmap not found")
+        items = (
+            db.query(RoadmapItem)
+            .filter(RoadmapItem.mini_roadmap_id == mini_roadmap_id)
+            .order_by(RoadmapItem.order_in_mini.asc())
+            .all()
+        )
+        if not items:
+            raise ValueError("Mini roadmap has no questions")
+        roadmap_item = items[0]
     if not roadmap_item:
         raise ValueError("Roadmap item not found")
 
-    state = (
-        db.query(RoadmapState)
-        .filter(
-            RoadmapState.student_id == student_id,
-            RoadmapState.roadmap_item_id == roadmap_item_id,
-        )
-        .one_or_none()
-    )
+    state_query = db.query(RoadmapState).filter(RoadmapState.student_id == student_id)
+    if mini_roadmap_id:
+        state_query = state_query.filter(RoadmapState.mini_roadmap_id == mini_roadmap_id)
+    else:
+        state_query = state_query.filter(RoadmapState.roadmap_item_id == roadmap_item.id)
+    state = state_query.one_or_none()
 
     if not state:
         state = RoadmapState(
             student_id=student_id,
-            roadmap_item_id=roadmap_item_id,
+            roadmap_item_id=roadmap_item.id,
+            mini_roadmap_id=mini_roadmap_id,
             consecutive_failures=0,
             phase=RoadmapPhase.A,
             updated_at=datetime.utcnow(),
+            step_index=0,
         )
         db.add(state)
         db.flush()
+
+    if mini_roadmap_id:
+        step_index = min(state.consecutive_failures, 3)
+        items = (
+            db.query(RoadmapItem)
+            .filter(RoadmapItem.mini_roadmap_id == mini_roadmap_id)
+            .order_by(RoadmapItem.order_in_mini.asc())
+            .all()
+        )
+        roadmap_item = items[min(step_index, len(items) - 1)]
+        state.step_index = step_index
+        question = (
+            db.query(AiQuestion)
+            .filter(AiQuestion.roadmap_item_id == roadmap_item.id)
+            .order_by(AiQuestion.created_at.asc())
+            .first()
+        )
+        if not question:
+            raise ValueError("Question not prepared for this mini roadmap")
+
+        hint = question.hint if state.consecutive_failures >= 2 else None
+        explanation = question.explanation if state.consecutive_failures >= 3 else None
+        state.last_question_id = question.id
+        state.updated_at = datetime.utcnow()
+        db.commit()
+        return _serialize_ai_question(question, hint, explanation)
 
     phase = _select_phase(state)
     messages = _build_messages(roadmap_item, phase, chunk_context)

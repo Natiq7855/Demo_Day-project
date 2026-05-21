@@ -2,7 +2,8 @@ if (window.location.protocol === "file:") {
   window.location.href = `http://127.0.0.1:5501/${window.location.pathname.split(/[\\/]/).pop() || "index.html"}`;
 }
 
-let API_BASE = localStorage.getItem("curricula_api_base") || "http://127.0.0.1:8010";
+const API_BASE = "http://127.0.0.1:8000";
+localStorage.setItem("curricula_api_base", API_BASE);
 const pageName = window.location.pathname.split("/").pop();
 const state = {
   token: localStorage.getItem("curricula_token") || "",
@@ -12,6 +13,7 @@ const state = {
   data: {},
   message: "",
   error: "",
+  loading: false,
 };
 
 const app = document.querySelector("#app");
@@ -38,7 +40,15 @@ async function api(path, options = {}) {
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    throw new Error(payload.detail || payload.message || "Request failed");
+    const detail = payload && typeof payload === "object"
+      ? payload.detail || payload.message || payload.error
+      : payload;
+    const message = typeof detail === "string"
+      ? detail
+      : detail
+        ? JSON.stringify(detail)
+        : "Request failed";
+    throw new Error(message);
   }
   return payload;
 }
@@ -71,7 +81,17 @@ function escapeHtml(value) {
 }
 
 function formData(event) {
-  return Object.fromEntries(new FormData(event.target, event.submitter).entries());
+  const output = {};
+  for (const [key, value] of new FormData(event.target, event.submitter).entries()) {
+    if (output[key] === undefined) {
+      output[key] = value;
+    } else if (Array.isArray(output[key])) {
+      output[key].push(value);
+    } else {
+      output[key] = [output[key], value];
+    }
+  }
+  return output;
 }
 
 async function boot() {
@@ -127,15 +147,14 @@ async function loadAdmin() {
     state.data = { students, pending, classes, groups };
   }
   if (state.view === "content") {
-    const [pdfs, summary, classes, groups, students, exams] = await Promise.all([
-      api("/admin/pdfs"),
+    const [summary, classes, groups, students, exams] = await Promise.all([
       api("/roadmaps/admin/summary"),
       api("/users/classes"),
       api("/users/groups"),
       api("/admin/students"),
       api("/practice-exams/admin/list"),
     ]);
-    state.data = { pdfs, summary, classes, groups, students, exams };
+    state.data = { summary, classes, groups, students, exams };
   }
   if (state.view === "analytics") {
     const summary = await api("/roadmaps/admin/summary");
@@ -170,7 +189,7 @@ function renderAuth() {
         <div>
           <div class="brand"><span class="brand-mark">CA</span> Curricula AI</div>
           <h1>Adaptive learning for every classroom.</h1>
-          <p>Manage approvals, upload learning material, generate Groq-powered roadmaps, and give students a focused practice workspace.</p>
+          <p>Manage approvals, build teacher-made roadmaps, and give students a focused practice workspace.</p>
         </div>
       </section>
       <section class="auth-panel">
@@ -269,6 +288,7 @@ function render() {
         <section class="content">
           ${state.error ? `<div class="alert error">${escapeHtml(state.error)}</div>` : ""}
           ${state.message ? `<div class="alert success">${escapeHtml(state.message)}</div>` : ""}
+          ${state.loading ? `<div class="loading-bar"><span></span></div>` : ""}
           ${state.me.role === "admin" ? renderAdmin() : renderStudent()}
         </section>
       </div>
@@ -347,29 +367,19 @@ function adminStudents() {
 }
 
 function adminContent() {
-  const { pdfs = [], summary = [], classes = [], groups = [], students = [], exams = [] } = state.data;
+  const { summary = [], classes = [], groups = [], students = [], exams = [] } = state.data;
   return `
     <div class="section-title"><h2>Content Studio</h2><button data-refresh>Refresh</button></div>
     <div class="grid two">
       <div class="card">
-        <h3>Upload PDF</h3>
-        <form class="form" data-action="upload-pdf">
-          <label>Title<input name="title" required /></label>
-          <label>Chapter<input name="chapter" /></label>
-          <label>PDF<input name="file" type="file" accept="application/pdf" required /></label>
-          <button type="submit">Upload material</button>
-        </form>
-      </div>
-      <div class="card">
-        <h3>Generate Questions</h3>
-        <form class="form" data-action="generate-roadmap">
-          <label>PDF<select name="pdf_id" required>${options(pdfs)}</select></label>
-          <label>Roadmap title<input name="title" required /></label>
-          <div class="grid two">
-            <label>Start page<input name="page_start" type="number" min="1" /></label>
-            <label>End page<input name="page_end" type="number" min="1" /></label>
+        <h3>Create Roadmap</h3>
+        <form class="form" data-action="create-roadmap-manual">
+          <label>Roadmap title<input name="roadmap_title" required /></label>
+          <div class="mini-wrap" data-mini-container>
+            ${manualMiniMarkup()}
           </div>
-          <button type="submit">Create question set</button>
+          <button type="button" class="secondary" data-add-mini>Add mini roadmap</button>
+          <button type="submit">Create roadmap</button>
         </form>
       </div>
       <div class="card">
@@ -385,6 +395,7 @@ function adminContent() {
         <form class="form" data-action="upload-exam">
           <label>Title<input name="title" required /></label>
           <label>File<input name="file" type="file" required /></label>
+          <label>Answer sheet<textarea name="answer_key" rows="6" placeholder="One answer per line" required></textarea></label>
           <button type="submit">Upload practice exam</button>
         </form>
         <hr />
@@ -393,6 +404,20 @@ function adminContent() {
           ${targetControls(classes, groups, students)}
           <button type="submit">Assign exam</button>
         </form>
+        <hr />
+        <form class="form" data-action="unassign-exam">
+          <label>Exam<select name="practice_exam_id" required>${options(exams)}</select></label>
+          ${targetControls(classes, groups, students)}
+          <button type="submit" class="secondary">Remove access</button>
+        </form>
+        <div style="margin-top:18px">
+          <h4 style="margin:0 0 10px">All practice exams</h4>
+          ${exams.length ? table(["Exam", "Questions", "Action"], exams.map((exam) => [
+            escapeHtml(exam.title),
+            exam.question_count || 0,
+            `<button class="danger" data-delete-exam="${exam.id}">Delete</button>`,
+          ])) : `<p class="muted">No practice exams yet.</p>`}
+        </div>
       </div>
     </div>
   `;
@@ -426,16 +451,28 @@ function studentDashboard() {
       <div class="card">
         <h3>Practice Exams</h3>
         ${exams.length ? exams.map((exam) => `
-          <div class="choice">
-            <strong>${escapeHtml(exam.title)}</strong>
-            <div class="row" style="margin-top:10px">
-              <button class="secondary" data-download-exam="${exam.id}" data-filename="${escapeHtml(exam.title)}">Download</button>
-              <form class="row" data-action="submit-exam">
-                <input type="hidden" name="practice_exam_id" value="${exam.id}" />
-                <input name="score" type="number" min="0" max="100" placeholder="Private score" required />
-                <button type="submit">Save</button>
-              </form>
+          <div class="choice exam-card">
+            <div class="exam-header">
+              <div>
+                <strong>${escapeHtml(exam.title)}</strong>
+                <div class="row" style="margin-top:10px">
+                  <button class="secondary" data-download-exam="${exam.id}" data-filename="${escapeHtml(exam.title)}">Download</button>
+                </div>
+                <p class="muted">${exam.question_count || 0} questions · ${exam.question_count ? "Answer each question below" : "Enter one answer per line"}</p>
+              </div>
+              <div class="exam-answers">
+                ${exam.submitted
+                  ? `<div class="pill ok">Submitted</div><p class="muted" style="margin:8px 0 0">Score: ${exam.score ?? "-"}%</p>`
+                  : `<div class="pill">Answer sheet</div>`}
+              </div>
             </div>
+            ${exam.submitted
+              ? `<p class="muted">You can submit only once for this exam.</p>`
+              : `<form class="form" data-action="submit-exam">
+                  <input type="hidden" name="practice_exam_id" value="${exam.id}" />
+                  ${examAnswerFields(exam)}
+                  <button type="submit">Submit answers</button>
+                </form>`}
           </div>
         `).join("") : `<p class="muted">No practice exam assigned yet.</p>`}
       </div>
@@ -458,9 +495,9 @@ function studentRoadmaps() {
         <div style="margin-top:18px">
           ${items.length ? items.map((item) => `
             <div class="choice">
-              <strong>${item.sequence_index}. ${escapeHtml(item.topic)}</strong>
-              <p class="muted">${escapeHtml(item.question_type)} · ${escapeHtml(item.difficulty)}</p>
-              <button data-question="${item.id}">Open question</button>
+              <strong>Mini roadmap ${item.sequence_index}</strong>
+              <p class="muted">${escapeHtml(item.question_type)}</p>
+              <button data-mini-roadmap="${item.id}">Open question</button>
             </div>
           `).join("") : `<p class="muted">Choose a roadmap to see its topics.</p>`}
         </div>
@@ -475,23 +512,31 @@ function studentRoadmaps() {
 
 function renderQuestion() {
   const payload = state.data.question;
-  const itemId = state.data.activeItemId;
+  const miniId = state.data.activeMiniId;
   if (!payload) return `<p class="muted">Open a saved question from the roadmap.</p>`;
   const question = payload.question || {};
   const choices = Array.isArray(question.choices) ? question.choices : [];
   return `
-    <div class="question">
-      <span class="pill">${escapeHtml(question.type || "question")}</span>
-      <h3>${escapeHtml(question.text || "")}</h3>
-      ${choices.map((choice) => `<div class="choice">${escapeHtml(choice.label || choice.id || "")}. ${escapeHtml(choice.text || choice)}</div>`).join("")}
-      ${payload.hint ? `<p><strong>Hint:</strong> ${escapeHtml(payload.hint)}</p>` : ""}
-      ${payload.explanation ? `<p><strong>Explanation:</strong> ${escapeHtml(payload.explanation)}</p>` : ""}
-    </div>
-    <form class="row" data-action="submit-attempt" style="margin-top:16px">
-      <input type="hidden" name="roadmap_item_id" value="${itemId}" />
+    <form class="form" data-action="submit-attempt">
+      <div class="question">
+        <span class="pill">${escapeHtml(question.type || "question")}</span>
+        <h3>${escapeHtml(question.text || "")}</h3>
+        ${choices.map((choice, index) => {
+          const label = choice?.label || choice?.id || String.fromCharCode(65 + index);
+          const text = choice?.text || choice;
+          return `
+            <label class="choice">
+              <input type="radio" name="selected_answer" value="${escapeHtml(label)}" required />
+              <span>${escapeHtml(label)}. ${escapeHtml(text)}</span>
+            </label>
+          `;
+        }).join("")}
+        ${payload.hint ? `<p><strong>Hint:</strong> ${escapeHtml(payload.hint)}</p>` : ""}
+        ${payload.explanation ? `<p><strong>Explanation:</strong> ${escapeHtml(payload.explanation)}</p>` : ""}
+      </div>
+      <input type="hidden" name="mini_roadmap_id" value="${miniId}" />
       <input type="hidden" name="question_id" value="${question.id || 0}" />
-      <button name="is_correct" value="true">I got it right</button>
-      <button class="secondary" name="is_correct" value="false">I need another</button>
+      <button type="submit">Submit answer</button>
     </form>
   `;
 }
@@ -542,6 +587,18 @@ function roadmapSummaryTable(summary, includeActions = false) {
   ) + (state.data.progressDetails ? `<div style="margin-top:18px">${progressDetails()}</div>` : "");
 }
 
+function examAnswerFields(exam) {
+  const count = Number(exam.question_count || 0);
+  if (!count) {
+    return `<textarea name="answers" rows="5" placeholder="A&#10;B&#10;C" required></textarea>`;
+  }
+  return Array.from({ length: count }, (_, index) => `
+    <label>Answer ${index + 1}
+      <input name="answers" data-answer-input placeholder="A" maxlength="5" required />
+    </label>
+  `).join("");
+}
+
 function progressDetails() {
   const details = state.data.progressDetails;
   return `
@@ -572,6 +629,41 @@ function options(items) {
 
 function roadmapOptions(items) {
   return (items || []).map((item) => `<option value="${item.roadmap_id}">${escapeHtml(item.title)}</option>`).join("");
+}
+
+function pdfSelectionRow(pdfs) {
+  return `
+    <div class="row pdf-row" data-pdf-row>
+      <select name="pdf_id" required>${options(pdfs)}</select>
+      <input name="page_start" type="number" min="1" placeholder="Start page" />
+      <input name="page_end" type="number" min="1" placeholder="End page" />
+      <button type="button" class="secondary" data-remove-pdf>Remove</button>
+    </div>
+  `;
+}
+
+function manualMiniMarkup() {
+  return `
+    <div class="mini" data-mini>
+      <label>Mini title<input name="mini_title" required /></label>
+      <div class="questions" data-questions>
+        ${manualQuestionRow()}
+      </div>
+      <button type="button" class="secondary" data-add-question>Add question</button>
+    </div>
+  `;
+}
+
+function manualQuestionRow() {
+  return `
+    <div class="question-row" data-question>
+      <label>Question text<textarea name="question_text"></textarea></label>
+      <label>Or upload media<input name="media" type="file" accept="image/*,application/pdf" /></label>
+      <label>Choices<textarea name="choices" placeholder="One choice per line" required></textarea></label>
+      <label>Answer key<input name="answer_key" required /></label>
+      <button type="button" class="secondary" data-remove-question>Remove</button>
+    </div>
+  `;
 }
 
 function targetControls(classes, groups, students) {
@@ -637,22 +729,57 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const question = event.target.closest("[data-question]");
-  if (question) {
-    const item = (state.data.items || []).find((entry) => entry.id === Number(question.dataset.question));
-    state.data.question = {
-      question: item?.question || {
-        id: 0,
-        type: item?.question_type || "question",
-        difficulty: item?.difficulty || "medium",
-        text: "No saved question found for this roadmap item.",
-        choices: [],
-      },
-      hint: item?.question?.hint,
-      explanation: item?.question?.explanation,
-    };
-    state.data.activeItemId = Number(question.dataset.question);
-    render();
+  const addPdf = event.target.closest("[data-add-pdf]");
+  if (addPdf) {
+    const container = addPdf.closest("form")?.querySelector("[data-pdf-selection]");
+    if (container) {
+      container.insertAdjacentHTML("beforeend", pdfSelectionRow(state.data.pdfs || []));
+    }
+    return;
+  }
+
+  const removePdf = event.target.closest("[data-remove-pdf]");
+  if (removePdf) {
+    const row = removePdf.closest("[data-pdf-row]");
+    if (row) row.remove();
+    return;
+  }
+
+  const miniRoadmap = event.target.closest("[data-mini-roadmap]");
+  if (miniRoadmap) {
+    try {
+      const miniRoadmapId = Number(miniRoadmap.dataset.miniRoadmap);
+      const payload = await api("/roadmaps/next-question", {
+        method: "POST",
+        body: JSON.stringify({ mini_roadmap_id: miniRoadmapId }),
+      });
+      state.data.question = payload;
+      state.data.activeMiniId = miniRoadmapId;
+      render();
+    } catch (error) {
+      setMessage("", error.message);
+    }
+    return;
+  }
+
+  const addMini = event.target.closest("[data-add-mini]");
+  if (addMini) {
+    const container = document.querySelector("[data-mini-container]");
+    if (container) container.insertAdjacentHTML("beforeend", manualMiniMarkup());
+    return;
+  }
+
+  const addQuestion = event.target.closest("[data-add-question]");
+  if (addQuestion) {
+    const questions = addQuestion.closest("[data-mini]")?.querySelector("[data-questions]");
+    if (questions) questions.insertAdjacentHTML("beforeend", manualQuestionRow());
+    return;
+  }
+
+  const removeQuestion = event.target.closest("[data-remove-question]");
+  if (removeQuestion) {
+    const row = removeQuestion.closest("[data-question]");
+    if (row) row.remove();
     return;
   }
 
@@ -674,6 +801,18 @@ document.addEventListener("click", async (event) => {
         `/practice-exams/student/download/${examDownload.dataset.downloadExam}`,
         `${examDownload.dataset.filename || "practice-exam"}`,
       );
+    } catch (error) {
+      setMessage("", error.message);
+    }
+  }
+
+  const deleteExam = event.target.closest("[data-delete-exam]");
+  if (deleteExam) {
+    try {
+      await api(`/practice-exams/admin/${deleteExam.dataset.deleteExam}`, { method: "DELETE" });
+      await loadView();
+      state.message = "Practice exam deleted.";
+      render();
     } catch (error) {
       setMessage("", error.message);
     }
@@ -722,10 +861,68 @@ document.addEventListener("submit", async (event) => {
     if (action === "create-class") await api("/users/classes", { method: "POST", body: JSON.stringify(data) });
     if (action === "create-group") await api("/users/groups", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["class_id"])) });
     if (action === "assign-student") await api("/users/assign-student", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["student_id", "class_id", "group_id"])) });
-    if (action === "generate-roadmap") await api("/roadmaps/generate", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["pdf_id", "page_start", "page_end"])) });
+    if (action === "generate-roadmap") {
+      const payload = { title: data.title };
+      const pdfIds = Array.isArray(data.pdf_id) ? data.pdf_id : (data.pdf_id ? [data.pdf_id] : []);
+      const pageStarts = Array.isArray(data.page_start) ? data.page_start : [data.page_start];
+      const pageEnds = Array.isArray(data.page_end) ? data.page_end : [data.page_end];
+      payload.pdf_selections = pdfIds.map((pdfId, index) => ({
+        pdf_id: Number(pdfId),
+        page_start: pageStarts[index] ? Number(pageStarts[index]) : null,
+        page_end: pageEnds[index] ? Number(pageEnds[index]) : null,
+      })).filter((selection) => selection.pdf_id);
+      if (!payload.pdf_selections.length) {
+        throw new Error("Select at least one PDF");
+      }
+      state.loading = true;
+      render();
+      try {
+        await api("/roadmaps/generate", { method: "POST", body: JSON.stringify(payload) });
+      } finally {
+        state.loading = false;
+      }
+    }
+    if (action === "create-roadmap-manual") {
+      const payload = { title: data.roadmap_title, minis: [] };
+      const minis = Array.from(form.querySelectorAll("[data-mini]") || []);
+      for (const miniEl of minis) {
+        const miniTitle = miniEl.querySelector("input[name=mini_title]").value;
+        const questions = [];
+        for (const qEl of miniEl.querySelectorAll("[data-question]")) {
+          const text = qEl.querySelector("textarea[name=question_text]")?.value || "";
+          const fileInput = qEl.querySelector("input[name=media]");
+          let media = null;
+          if (fileInput && fileInput.files && fileInput.files.length) {
+            const file = fileInput.files[0];
+            const formData = new FormData();
+            formData.append("file", file);
+            const uploadResult = await api("/roadmaps/admin/upload", { method: "POST", body: formData });
+            media = uploadResult;
+          }
+          const choices = (qEl.querySelector("textarea[name=choices]")?.value || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+          const answer_key = qEl.querySelector("input[name=answer_key]")?.value || "";
+          questions.push({ question_text: text || null, media_type: media?.media_type || null, media_path: media?.media_path || null, choices, answer_key });
+        }
+        payload.minis.push({ title: miniTitle, questions });
+      }
+      await api("/roadmaps/admin/create", { method: "POST", body: JSON.stringify(payload) });
+      await loadView();
+      state.message = "Roadmap created.";
+      render();
+      return;
+    }
     if (action === "assign-roadmap") await api("/roadmaps/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["roadmap_id", "target_id"])) });
     if (action === "assign-exam") await api("/practice-exams/admin/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
-    if (action === "submit-exam") await api("/practice-exams/student/submit", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "score"])) });
+    if (action === "unassign-exam") await api("/practice-exams/admin/unassign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
+    if (action === "submit-exam") {
+      const payload = cleanNumbers(data, ["practice_exam_id"]);
+      payload.answers = parseExamAnswers(data.answers);
+      const result = await api("/practice-exams/student/submit", { method: "POST", body: JSON.stringify(payload) });
+      await loadView();
+      state.message = `Score: ${result.score}% (${result.correct_count}/${result.total_questions})`;
+      render();
+      return;
+    }
 
     if (action === "upload-pdf") {
       await upload("/admin/upload-pdf", form);
@@ -740,15 +937,40 @@ document.addEventListener("submit", async (event) => {
       return;
     }
     if (action === "submit-attempt") {
-      await api("/roadmaps/submit", {
+      if (!data.selected_answer) {
+        setMessage("", "Choose an answer first.");
+        return;
+      }
+      const submitResult = await api("/roadmaps/submit", {
         method: "POST",
         body: JSON.stringify({
-          roadmap_item_id: Number(data.roadmap_item_id),
+          mini_roadmap_id: Number(data.mini_roadmap_id),
           question_id: Number(data.question_id || 0),
-          is_correct: data.is_correct === "true",
+          selected_answer: data.selected_answer,
         }),
       });
-      state.data.question = null;
+      const miniRoadmapId = Number(data.mini_roadmap_id);
+      if (submitResult.is_correct) {
+        const minis = state.data.items || [];
+        const currentIndex = minis.findIndex((item) => item.id === miniRoadmapId);
+        const nextMini = currentIndex >= 0 && currentIndex + 1 < minis.length ? minis[currentIndex + 1] : null;
+        if (nextMini) {
+          state.data.question = await api("/roadmaps/next-question", {
+            method: "POST",
+            body: JSON.stringify({ mini_roadmap_id: nextMini.id }),
+          });
+          state.data.activeMiniId = nextMini.id;
+        } else {
+          state.data.question = null;
+          setMessage("Mini roadmaps completed.");
+        }
+      } else {
+        state.data.question = await api("/roadmaps/next-question", {
+          method: "POST",
+          body: JSON.stringify({ mini_roadmap_id: miniRoadmapId }),
+        });
+        state.data.activeMiniId = miniRoadmapId;
+      }
     }
 
     await loadView();
@@ -792,9 +1014,40 @@ async function downloadFile(path, fallbackName) {
 function cleanNumbers(data, keys) {
   const output = { ...data };
   keys.forEach((key) => {
-    output[key] = output[key] === "" || output[key] == null ? null : Number(output[key]);
+    if (Array.isArray(output[key])) {
+      output[key] = output[key]
+        .map((value) => (value === "" || value == null ? null : Number(value)))
+        .filter((value) => value != null);
+    } else {
+      output[key] = output[key] === "" || output[key] == null ? null : Number(output[key]);
+    }
   });
   return output;
 }
+
+function parseAnswerList(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseExamAnswers(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeLetterAnswer(item)).filter(Boolean);
+  }
+  return parseAnswerList(value).map((item) => normalizeLetterAnswer(item)).filter(Boolean);
+}
+
+function normalizeLetterAnswer(value) {
+  return String(value || "").replace(/[^a-zA-Z]/g, "").toUpperCase();
+}
+
+document.addEventListener("input", (event) => {
+  const input = event.target.closest("[data-answer-input]");
+  if (!input) return;
+  const normalized = normalizeLetterAnswer(input.value);
+  if (input.value !== normalized) input.value = normalized;
+});
 
 boot();
