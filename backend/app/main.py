@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.db.base import Base
@@ -31,6 +32,59 @@ def health_check():
 def prepare_dev_database():
     if settings.database_url.startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
+        with engine.connect() as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(practice_exams)"))
+            }
+            if "answer_key" not in columns:
+                connection.execute(text("ALTER TABLE practice_exams ADD COLUMN answer_key TEXT"))
+                connection.commit()
+            attempt_columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(practice_exam_attempts)"))
+            }
+            if "answers" not in attempt_columns:
+                connection.execute(text("ALTER TABLE practice_exam_attempts ADD COLUMN answers TEXT"))
+            if "correct_count" not in attempt_columns:
+                connection.execute(text("ALTER TABLE practice_exam_attempts ADD COLUMN correct_count INTEGER"))
+            if "total_questions" not in attempt_columns:
+                connection.execute(text("ALTER TABLE practice_exam_attempts ADD COLUMN total_questions INTEGER"))
+            source_columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(roadmap_source_pdfs)"))
+            }
+            if "page_start" not in source_columns:
+                connection.execute(text("ALTER TABLE roadmap_source_pdfs ADD COLUMN page_start INTEGER"))
+            if "page_end" not in source_columns:
+                connection.execute(text("ALTER TABLE roadmap_source_pdfs ADD COLUMN page_end INTEGER"))
+
+            item_columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(roadmap_items)"))
+            }
+            if "mini_roadmap_id" not in item_columns:
+                connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN mini_roadmap_id INTEGER"))
+            if "order_in_mini" not in item_columns:
+                connection.execute(text("ALTER TABLE roadmap_items ADD COLUMN order_in_mini INTEGER"))
+
+            attempt_columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(roadmap_attempts)"))
+            }
+            if "mini_roadmap_id" not in attempt_columns:
+                connection.execute(text("ALTER TABLE roadmap_attempts ADD COLUMN mini_roadmap_id INTEGER"))
+
+            state_columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(roadmap_state)"))
+            }
+            if "mini_roadmap_id" not in state_columns:
+                connection.execute(text("ALTER TABLE roadmap_state ADD COLUMN mini_roadmap_id INTEGER"))
+            if "step_index" not in state_columns:
+                connection.execute(text("ALTER TABLE roadmap_state ADD COLUMN step_index INTEGER"))
+
+            connection.commit()
 
 
 app.include_router(auth.router, prefix="/auth", tags=["auth"])

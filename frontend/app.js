@@ -12,6 +12,7 @@ const state = {
   data: {},
   message: "",
   error: "",
+  loading: false,
 };
 
 const app = document.querySelector("#app");
@@ -287,6 +288,7 @@ function render() {
         <section class="content">
           ${state.error ? `<div class="alert error">${escapeHtml(state.error)}</div>` : ""}
           ${state.message ? `<div class="alert success">${escapeHtml(state.message)}</div>` : ""}
+          ${state.loading ? `<div class="loading-bar"><span></span></div>` : ""}
           ${state.me.role === "admin" ? renderAdmin() : renderStudent()}
         </section>
       </div>
@@ -381,12 +383,12 @@ function adminContent() {
       <div class="card">
         <h3>Generate AI Questions</h3>
         <form class="form" data-action="generate-roadmap">
-          <label>PDFs<select name="pdf_ids" multiple required>${options(pdfs)}</select></label>
-          <label>Roadmap title<input name="title" required /></label>
-          <div class="grid two">
-            <label>Start page<input name="page_start" type="number" min="1" /></label>
-            <label>End page<input name="page_end" type="number" min="1" /></label>
+          <label>PDF selections</label>
+          <div class="pdf-selection" data-pdf-selection>
+            ${pdfSelectionRow(pdfs)}
           </div>
+          <button type="button" class="secondary" data-add-pdf>Add PDF</button>
+          <label>Roadmap title<input name="title" required /></label>
           <p class="muted">Tip: Select multiple PDFs to mix sources and question types.</p>
           <button type="submit">Create AI question set</button>
         </form>
@@ -413,6 +415,20 @@ function adminContent() {
           ${targetControls(classes, groups, students)}
           <button type="submit">Assign exam</button>
         </form>
+        <hr />
+        <form class="form" data-action="unassign-exam">
+          <label>Exam<select name="practice_exam_id" required>${options(exams)}</select></label>
+          ${targetControls(classes, groups, students)}
+          <button type="submit" class="secondary">Remove access</button>
+        </form>
+        <div style="margin-top:18px">
+          <h4 style="margin:0 0 10px">All practice exams</h4>
+          ${exams.length ? table(["Exam", "Questions", "Action"], exams.map((exam) => [
+            escapeHtml(exam.title),
+            exam.question_count || 0,
+            `<button class="danger" data-delete-exam="${exam.id}">Delete</button>`,
+          ])) : `<p class="muted">No practice exams yet.</p>`}
+        </div>
       </div>
     </div>
   `;
@@ -446,17 +462,28 @@ function studentDashboard() {
       <div class="card">
         <h3>Practice Exams</h3>
         ${exams.length ? exams.map((exam) => `
-          <div class="choice">
-            <strong>${escapeHtml(exam.title)}</strong>
-            <div class="row" style="margin-top:10px">
-              <button class="secondary" data-download-exam="${exam.id}" data-filename="${escapeHtml(exam.title)}">Download</button>
+          <div class="choice exam-card">
+            <div class="exam-header">
+              <div>
+                <strong>${escapeHtml(exam.title)}</strong>
+                <div class="row" style="margin-top:10px">
+                  <button class="secondary" data-download-exam="${exam.id}" data-filename="${escapeHtml(exam.title)}">Download</button>
+                </div>
+                <p class="muted">${exam.question_count || 0} questions · ${exam.question_count ? "Answer each question below" : "Enter one answer per line"}</p>
+              </div>
+              <div class="exam-answers">
+                ${exam.submitted
+                  ? `<div class="pill ok">Submitted</div><p class="muted" style="margin:8px 0 0">Score: ${exam.score ?? "-"}%</p>`
+                  : `<div class="pill">Answer sheet</div>`}
+              </div>
             </div>
-            <p class="muted">${exam.question_count || 0} questions · ${exam.question_count ? "Answer each question below" : "Enter one answer per line"}</p>
-            <form class="form" data-action="submit-exam">
-              <input type="hidden" name="practice_exam_id" value="${exam.id}" />
-              ${examAnswerFields(exam)}
-              <button type="submit">Submit answers</button>
-            </form>
+            ${exam.submitted
+              ? `<p class="muted">You can submit only once for this exam.</p>`
+              : `<form class="form" data-action="submit-exam">
+                  <input type="hidden" name="practice_exam_id" value="${exam.id}" />
+                  ${examAnswerFields(exam)}
+                  <button type="submit">Submit answers</button>
+                </form>`}
           </div>
         `).join("") : `<p class="muted">No practice exam assigned yet.</p>`}
       </div>
@@ -479,9 +506,9 @@ function studentRoadmaps() {
         <div style="margin-top:18px">
           ${items.length ? items.map((item) => `
             <div class="choice">
-              <strong>${item.sequence_index}. ${escapeHtml(item.topic)}</strong>
-              <p class="muted">${escapeHtml(item.question_type)} · ${escapeHtml(item.difficulty)}</p>
-              <button data-question="${item.id}">Open question</button>
+              <strong>Mini roadmap ${item.sequence_index}</strong>
+              <p class="muted">${escapeHtml(item.question_type)}</p>
+              <button data-mini-roadmap="${item.id}">Open question</button>
             </div>
           `).join("") : `<p class="muted">Choose a roadmap to see its topics.</p>`}
         </div>
@@ -496,23 +523,31 @@ function studentRoadmaps() {
 
 function renderQuestion() {
   const payload = state.data.question;
-  const itemId = state.data.activeItemId;
+  const miniId = state.data.activeMiniId;
   if (!payload) return `<p class="muted">Open a saved question from the roadmap.</p>`;
   const question = payload.question || {};
   const choices = Array.isArray(question.choices) ? question.choices : [];
   return `
-    <div class="question">
-      <span class="pill">${escapeHtml(question.type || "question")}</span>
-      <h3>${escapeHtml(question.text || "")}</h3>
-      ${choices.map((choice) => `<div class="choice">${escapeHtml(choice.label || choice.id || "")}. ${escapeHtml(choice.text || choice)}</div>`).join("")}
-      ${payload.hint ? `<p><strong>Hint:</strong> ${escapeHtml(payload.hint)}</p>` : ""}
-      ${payload.explanation ? `<p><strong>Explanation:</strong> ${escapeHtml(payload.explanation)}</p>` : ""}
-    </div>
-    <form class="row" data-action="submit-attempt" style="margin-top:16px">
-      <input type="hidden" name="roadmap_item_id" value="${itemId}" />
+    <form class="form" data-action="submit-attempt">
+      <div class="question">
+        <span class="pill">${escapeHtml(question.type || "question")}</span>
+        <h3>${escapeHtml(question.text || "")}</h3>
+        ${choices.map((choice, index) => {
+          const label = choice?.label || choice?.id || String.fromCharCode(65 + index);
+          const text = choice?.text || choice;
+          return `
+            <label class="choice">
+              <input type="radio" name="selected_answer" value="${escapeHtml(label)}" required />
+              <span>${escapeHtml(label)}. ${escapeHtml(text)}</span>
+            </label>
+          `;
+        }).join("")}
+        ${payload.hint ? `<p><strong>Hint:</strong> ${escapeHtml(payload.hint)}</p>` : ""}
+        ${payload.explanation ? `<p><strong>Explanation:</strong> ${escapeHtml(payload.explanation)}</p>` : ""}
+      </div>
+      <input type="hidden" name="mini_roadmap_id" value="${miniId}" />
       <input type="hidden" name="question_id" value="${question.id || 0}" />
-      <button name="is_correct" value="true">I got it right</button>
-      <button class="secondary" name="is_correct" value="false">I need another</button>
+      <button type="submit">Submit answer</button>
     </form>
   `;
 }
@@ -566,10 +601,12 @@ function roadmapSummaryTable(summary, includeActions = false) {
 function examAnswerFields(exam) {
   const count = Number(exam.question_count || 0);
   if (!count) {
-    return `<textarea name="answers" rows="5" placeholder="1) ...&#10;2) ...&#10;3) ..." required></textarea>`;
+    return `<textarea name="answers" rows="5" placeholder="A&#10;B&#10;C" required></textarea>`;
   }
   return Array.from({ length: count }, (_, index) => `
-    <label>Answer ${index + 1}<input name="answers" placeholder="Answer ${index + 1}" required /></label>
+    <label>Answer ${index + 1}
+      <input name="answers" data-answer-input placeholder="A" maxlength="5" required />
+    </label>
   `).join("");
 }
 
@@ -603,6 +640,17 @@ function options(items) {
 
 function roadmapOptions(items) {
   return (items || []).map((item) => `<option value="${item.roadmap_id}">${escapeHtml(item.title)}</option>`).join("");
+}
+
+function pdfSelectionRow(pdfs) {
+  return `
+    <div class="row pdf-row" data-pdf-row>
+      <select name="pdf_id" required>${options(pdfs)}</select>
+      <input name="page_start" type="number" min="1" placeholder="Start page" />
+      <input name="page_end" type="number" min="1" placeholder="End page" />
+      <button type="button" class="secondary" data-remove-pdf>Remove</button>
+    </div>
+  `;
 }
 
 function targetControls(classes, groups, students) {
@@ -668,16 +716,32 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const question = event.target.closest("[data-question]");
-  if (question) {
+  const addPdf = event.target.closest("[data-add-pdf]");
+  if (addPdf) {
+    const container = addPdf.closest("form")?.querySelector("[data-pdf-selection]");
+    if (container) {
+      container.insertAdjacentHTML("beforeend", pdfSelectionRow(state.data.pdfs || []));
+    }
+    return;
+  }
+
+  const removePdf = event.target.closest("[data-remove-pdf]");
+  if (removePdf) {
+    const row = removePdf.closest("[data-pdf-row]");
+    if (row) row.remove();
+    return;
+  }
+
+  const miniRoadmap = event.target.closest("[data-mini-roadmap]");
+  if (miniRoadmap) {
     try {
-      const roadmapItemId = Number(question.dataset.question);
+      const miniRoadmapId = Number(miniRoadmap.dataset.miniRoadmap);
       const payload = await api("/roadmaps/next-question", {
         method: "POST",
-        body: JSON.stringify({ roadmap_item_id: roadmapItemId }),
+        body: JSON.stringify({ mini_roadmap_id: miniRoadmapId }),
       });
       state.data.question = payload;
-      state.data.activeItemId = roadmapItemId;
+      state.data.activeMiniId = miniRoadmapId;
       render();
     } catch (error) {
       setMessage("", error.message);
@@ -703,6 +767,18 @@ document.addEventListener("click", async (event) => {
         `/practice-exams/student/download/${examDownload.dataset.downloadExam}`,
         `${examDownload.dataset.filename || "practice-exam"}`,
       );
+    } catch (error) {
+      setMessage("", error.message);
+    }
+  }
+
+  const deleteExam = event.target.closest("[data-delete-exam]");
+  if (deleteExam) {
+    try {
+      await api(`/practice-exams/admin/${deleteExam.dataset.deleteExam}`, { method: "DELETE" });
+      await loadView();
+      state.message = "Practice exam deleted.";
+      render();
     } catch (error) {
       setMessage("", error.message);
     }
@@ -752,15 +828,29 @@ document.addEventListener("submit", async (event) => {
     if (action === "create-group") await api("/users/groups", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["class_id"])) });
     if (action === "assign-student") await api("/users/assign-student", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["student_id", "class_id", "group_id"])) });
     if (action === "generate-roadmap") {
-      const payload = cleanNumbers(data, ["pdf_ids", "page_start", "page_end"]);
-      if (payload.pdf_ids != null && !Array.isArray(payload.pdf_ids)) payload.pdf_ids = [payload.pdf_ids];
-      if (!payload.pdf_id && Array.isArray(payload.pdf_ids) && payload.pdf_ids.length) {
-        payload.pdf_id = payload.pdf_ids[0];
+      const payload = { title: data.title };
+      const pdfIds = Array.isArray(data.pdf_id) ? data.pdf_id : (data.pdf_id ? [data.pdf_id] : []);
+      const pageStarts = Array.isArray(data.page_start) ? data.page_start : [data.page_start];
+      const pageEnds = Array.isArray(data.page_end) ? data.page_end : [data.page_end];
+      payload.pdf_selections = pdfIds.map((pdfId, index) => ({
+        pdf_id: Number(pdfId),
+        page_start: pageStarts[index] ? Number(pageStarts[index]) : null,
+        page_end: pageEnds[index] ? Number(pageEnds[index]) : null,
+      })).filter((selection) => selection.pdf_id);
+      if (!payload.pdf_selections.length) {
+        throw new Error("Select at least one PDF");
       }
-      await api("/roadmaps/generate", { method: "POST", body: JSON.stringify(payload) });
+      state.loading = true;
+      render();
+      try {
+        await api("/roadmaps/generate", { method: "POST", body: JSON.stringify(payload) });
+      } finally {
+        state.loading = false;
+      }
     }
     if (action === "assign-roadmap") await api("/roadmaps/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["roadmap_id", "target_id"])) });
     if (action === "assign-exam") await api("/practice-exams/admin/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
+    if (action === "unassign-exam") await api("/practice-exams/admin/unassign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
     if (action === "submit-exam") {
       const payload = cleanNumbers(data, ["practice_exam_id"]);
       payload.answers = parseExamAnswers(data.answers);
@@ -784,23 +874,39 @@ document.addEventListener("submit", async (event) => {
       return;
     }
     if (action === "submit-attempt") {
-      await api("/roadmaps/submit", {
+      if (!data.selected_answer) {
+        setMessage("", "Choose an answer first.");
+        return;
+      }
+      const submitResult = await api("/roadmaps/submit", {
         method: "POST",
         body: JSON.stringify({
-          roadmap_item_id: Number(data.roadmap_item_id),
+          mini_roadmap_id: Number(data.mini_roadmap_id),
           question_id: Number(data.question_id || 0),
-          is_correct: data.is_correct === "true",
+          selected_answer: data.selected_answer,
         }),
       });
-      if (data.is_correct === "true") {
-        state.data.question = null;
+      const miniRoadmapId = Number(data.mini_roadmap_id);
+      if (submitResult.is_correct) {
+        const minis = state.data.items || [];
+        const currentIndex = minis.findIndex((item) => item.id === miniRoadmapId);
+        const nextMini = currentIndex >= 0 && currentIndex + 1 < minis.length ? minis[currentIndex + 1] : null;
+        if (nextMini) {
+          state.data.question = await api("/roadmaps/next-question", {
+            method: "POST",
+            body: JSON.stringify({ mini_roadmap_id: nextMini.id }),
+          });
+          state.data.activeMiniId = nextMini.id;
+        } else {
+          state.data.question = null;
+          setMessage("Mini roadmaps completed.");
+        }
       } else {
-        const roadmapItemId = Number(data.roadmap_item_id);
         state.data.question = await api("/roadmaps/next-question", {
           method: "POST",
-          body: JSON.stringify({ roadmap_item_id: roadmapItemId }),
+          body: JSON.stringify({ mini_roadmap_id: miniRoadmapId }),
         });
-        state.data.activeItemId = roadmapItemId;
+        state.data.activeMiniId = miniRoadmapId;
       }
     }
 
@@ -865,9 +971,20 @@ function parseAnswerList(value) {
 
 function parseExamAnswers(value) {
   if (Array.isArray(value)) {
-    return value.map((item) => String(item).trim()).filter(Boolean);
+    return value.map((item) => normalizeLetterAnswer(item)).filter(Boolean);
   }
-  return parseAnswerList(value);
+  return parseAnswerList(value).map((item) => normalizeLetterAnswer(item)).filter(Boolean);
 }
+
+function normalizeLetterAnswer(value) {
+  return String(value || "").replace(/[^a-zA-Z]/g, "").toUpperCase();
+}
+
+document.addEventListener("input", (event) => {
+  const input = event.target.closest("[data-answer-input]");
+  if (!input) return;
+  const normalized = normalizeLetterAnswer(input.value);
+  if (input.value !== normalized) input.value = normalized;
+});
 
 boot();

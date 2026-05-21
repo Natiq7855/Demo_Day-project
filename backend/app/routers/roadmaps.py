@@ -15,6 +15,7 @@ from app.db.models import (
     RoadmapAttempt,
     RoadmapAssignment,
     RoadmapItem,
+    RoadmapMini,
     Roadmap,
     RoadmapPhase,
     RoadmapSourcePdf,
@@ -31,6 +32,10 @@ from app.services.adaptive_engine import generate_next_question
 from app.services.roadmap_generator import generate_roadmap
 
 router = APIRouter()
+
+
+def _normalize_answer(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
 
 
 def _get_pdf_context(
@@ -71,6 +76,25 @@ def _get_pdfs_context(
     return "\n\n".join(sections)
 
 
+def _get_pdfs_context_from_selections(db: Session, selections: list[dict]) -> str:
+    if not selections:
+        return ""
+    pdf_ids = [selection["pdf_id"] for selection in selections]
+    pdfs = db.query(Pdf).filter(Pdf.id.in_(pdf_ids)).all()
+    pdf_map = {pdf.id: pdf for pdf in pdfs}
+    missing = [pdf_id for pdf_id in pdf_ids if pdf_id not in pdf_map]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"PDFs not found: {', '.join(map(str, missing))}")
+    sections = []
+    for selection in selections:
+        pdf_id = selection["pdf_id"]
+        context = _get_pdf_context(db, pdf_id, selection.get("page_start"), selection.get("page_end"))
+        if context:
+            title = pdf_map[pdf_id].title
+            sections.append(f"PDF: {title}\n{context}")
+    return "\n\n".join(sections)
+
+
 def _get_roadmap_context(db: Session, roadmap_item_id: int) -> str:
     roadmap = (
         db.query(Roadmap)
@@ -81,12 +105,40 @@ def _get_roadmap_context(db: Session, roadmap_item_id: int) -> str:
     if not roadmap:
         return ""
     source_rows = (
-        db.query(RoadmapSourcePdf.pdf_id)
+        db.query(RoadmapSourcePdf)
         .filter(RoadmapSourcePdf.roadmap_id == roadmap.id)
         .all()
     )
-    pdf_ids = [pdf_id for (pdf_id,) in source_rows] if source_rows else [roadmap.pdf_id]
-    return _get_pdfs_context(db, pdf_ids, roadmap.page_start, roadmap.page_end)
+    if source_rows:
+        selections = [
+            {"pdf_id": row.pdf_id, "page_start": row.page_start, "page_end": row.page_end}
+            for row in source_rows
+        ]
+        return _get_pdfs_context_from_selections(db, selections)
+    return _get_pdfs_context(db, [roadmap.pdf_id], roadmap.page_start, roadmap.page_end)
+
+
+def _get_mini_roadmap_context(db: Session, mini_roadmap_id: int) -> str:
+    roadmap = (
+        db.query(Roadmap)
+        .join(RoadmapMini, RoadmapMini.roadmap_id == Roadmap.id)
+        .filter(RoadmapMini.id == mini_roadmap_id)
+        .one_or_none()
+    )
+    if not roadmap:
+        return ""
+    source_rows = (
+        db.query(RoadmapSourcePdf)
+        .filter(RoadmapSourcePdf.roadmap_id == roadmap.id)
+        .all()
+    )
+    if source_rows:
+        selections = [
+            {"pdf_id": row.pdf_id, "page_start": row.page_start, "page_end": row.page_end}
+            for row in source_rows
+        ]
+        return _get_pdfs_context_from_selections(db, selections)
+    return _get_pdfs_context(db, [roadmap.pdf_id], roadmap.page_start, roadmap.page_end)
 
 
 def _get_student_targets(current_user: User) -> dict[str, list[int]]:
@@ -175,18 +227,36 @@ def _serialize_roadmap_item(db: Session, item: RoadmapItem) -> dict:
     }
 
 
+def _serialize_mini_roadmap(mini: RoadmapMini) -> dict:
+    return {
+        "id": mini.id,
+        "roadmap_id": mini.roadmap_id,
+        "question_type": mini.question_type,
+        "sequence_index": mini.sequence_index,
+    }
+
+
 @router.post("/generate")
 def create_roadmap(
     payload: RoadmapGenerateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    selections = []
+    if payload.pdf_selections:
+        selections = [selection.model_dump() for selection in payload.pdf_selections]
     pdf_ids = payload.pdf_ids or ([payload.pdf_id] if payload.pdf_id else [])
     pdf_ids = [pdf_id for pdf_id in pdf_ids if pdf_id is not None]
+    if selections:
+        pdf_ids = [selection["pdf_id"] for selection in selections]
     if not pdf_ids:
         raise HTTPException(status_code=400, detail="Select at least one PDF")
 
-    chunk_context = _get_pdfs_context(db, pdf_ids, payload.page_start, payload.page_end)
+    chunk_context = (
+        _get_pdfs_context_from_selections(db, selections)
+        if selections
+        else _get_pdfs_context(db, pdf_ids, payload.page_start, payload.page_end)
+    )
     if not chunk_context:
         raise HTTPException(status_code=400, detail="No PDF content found for selection")
 
@@ -199,6 +269,7 @@ def create_roadmap(
             created_by=current_user.id,
             page_start=payload.page_start,
             page_end=payload.page_end,
+            pdf_selections=selections,
         )
     except APIError as error:
         db.rollback()
@@ -219,7 +290,12 @@ def next_question(
         db=db,
         student_id=current_user.id,
         roadmap_item_id=payload.roadmap_item_id,
-        chunk_context=_get_roadmap_context(db, payload.roadmap_item_id),
+        mini_roadmap_id=payload.mini_roadmap_id,
+        chunk_context=(
+            _get_mini_roadmap_context(db, payload.mini_roadmap_id)
+            if payload.mini_roadmap_id
+            else _get_roadmap_context(db, payload.roadmap_item_id or 0)
+        ),
     )
     return response
 
@@ -230,22 +306,27 @@ def submit_attempt(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
-    item = db.get(RoadmapItem, payload.roadmap_item_id)
+    item = None
+    if payload.roadmap_item_id:
+        item = db.get(RoadmapItem, payload.roadmap_item_id)
+    if not item and payload.question_id:
+        question = db.get(AiQuestion, payload.question_id)
+        if question:
+            item = db.get(RoadmapItem, question.roadmap_item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Roadmap item not found")
 
-    state = (
-        db.query(RoadmapState)
-        .filter(
-            RoadmapState.student_id == current_user.id,
-            RoadmapState.roadmap_item_id == payload.roadmap_item_id,
-        )
-        .one_or_none()
-    )
+    state_query = db.query(RoadmapState).filter(RoadmapState.student_id == current_user.id)
+    if payload.mini_roadmap_id:
+        state_query = state_query.filter(RoadmapState.mini_roadmap_id == payload.mini_roadmap_id)
+    else:
+        state_query = state_query.filter(RoadmapState.roadmap_item_id == item.id)
+    state = state_query.one_or_none()
     if not state:
         state = RoadmapState(
             student_id=current_user.id,
-            roadmap_item_id=payload.roadmap_item_id,
+            roadmap_item_id=item.id,
+            mini_roadmap_id=payload.mini_roadmap_id,
             consecutive_failures=0,
             phase=RoadmapPhase.A,
             last_question_id=payload.question_id,
@@ -256,24 +337,53 @@ def submit_attempt(
         state.last_question_id = payload.question_id
 
     attempt_no = state.consecutive_failures + 1
-    status = AttemptStatus.correct if payload.is_correct else AttemptStatus.incorrect
+    is_correct = payload.is_correct
+    if payload.selected_answer is not None:
+        question = db.get(AiQuestion, payload.question_id)
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found")
+        expected = question.answer_key or []
+        normalized_expected = {_normalize_answer(value) for value in expected}
+        selected = _normalize_answer(payload.selected_answer)
+        if not normalized_expected:
+            raise HTTPException(status_code=400, detail="Answer key not available for this question")
+        if selected in normalized_expected:
+            is_correct = True
+        else:
+            choices = question.choices or []
+            if selected and selected.isalpha() and len(selected) == 1:
+                index = ord(selected.upper()) - ord("A")
+                if 0 <= index < len(choices):
+                    choice_value = choices[index]
+                    if _normalize_answer(choice_value) in normalized_expected:
+                        is_correct = True
+
+    if is_correct is None:
+        raise HTTPException(status_code=400, detail="Answer selection is required")
+
+    status = AttemptStatus.correct if is_correct else AttemptStatus.incorrect
     db.add(
         RoadmapAttempt(
             student_id=current_user.id,
-            roadmap_item_id=payload.roadmap_item_id,
+            roadmap_item_id=item.id,
+            mini_roadmap_id=payload.mini_roadmap_id,
             attempt_no=attempt_no,
             status=status,
         )
     )
 
-    if payload.is_correct:
+    if is_correct:
         state.consecutive_failures = 0
         state.phase = RoadmapPhase.A
     else:
         state.consecutive_failures += 1
 
     db.commit()
-    return {"status": status.value, "consecutive_failures": state.consecutive_failures}
+    return {
+        "status": status.value,
+        "consecutive_failures": state.consecutive_failures,
+        "is_correct": is_correct,
+    }
 
 
 @router.post("/assign")
@@ -347,6 +457,15 @@ def list_roadmap_items(
     if current_user.role == UserRole.student and not _is_student_assigned(db, roadmap_id, current_user):
         raise HTTPException(status_code=403, detail="Not assigned to this roadmap")
 
+    minis = (
+        db.query(RoadmapMini)
+        .filter(RoadmapMini.roadmap_id == roadmap_id)
+        .order_by(RoadmapMini.sequence_index.asc())
+        .all()
+    )
+    if minis:
+        return [_serialize_mini_roadmap(mini) for mini in minis]
+
     items = (
         db.query(RoadmapItem)
         .filter(RoadmapItem.roadmap_id == roadmap_id)
@@ -365,20 +484,34 @@ def student_roadmap_progress(
     if not _is_student_assigned(db, roadmap_id, current_user):
         raise HTTPException(status_code=403, detail="Not assigned to this roadmap")
 
-    total_items = db.query(func.count(RoadmapItem.id)).filter(RoadmapItem.roadmap_id == roadmap_id).scalar()
+    total_items = db.query(func.count(RoadmapMini.id)).filter(RoadmapMini.roadmap_id == roadmap_id).scalar()
+    if not total_items:
+        total_items = db.query(func.count(RoadmapItem.id)).filter(RoadmapItem.roadmap_id == roadmap_id).scalar()
     if not total_items:
         return {"roadmap_id": roadmap_id, "total_items": 0, "progress": 0}
 
-    correct_count = (
-        db.query(func.count(distinct(RoadmapAttempt.roadmap_item_id)))
-        .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
-        .filter(
-            RoadmapItem.roadmap_id == roadmap_id,
-            RoadmapAttempt.student_id == current_user.id,
-            RoadmapAttempt.status == AttemptStatus.correct,
+    if db.query(func.count(RoadmapMini.id)).filter(RoadmapMini.roadmap_id == roadmap_id).scalar():
+        correct_count = (
+            db.query(func.count(distinct(RoadmapAttempt.mini_roadmap_id)))
+            .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+            .filter(
+                RoadmapItem.roadmap_id == roadmap_id,
+                RoadmapAttempt.student_id == current_user.id,
+                RoadmapAttempt.status == AttemptStatus.correct,
+            )
+            .scalar()
         )
-        .scalar()
-    )
+    else:
+        correct_count = (
+            db.query(func.count(distinct(RoadmapAttempt.roadmap_item_id)))
+            .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+            .filter(
+                RoadmapItem.roadmap_id == roadmap_id,
+                RoadmapAttempt.student_id == current_user.id,
+                RoadmapAttempt.status == AttemptStatus.correct,
+            )
+            .scalar()
+        )
 
     percent = int(((correct_count or 0) / total_items) * 100)
     return {"roadmap_id": roadmap_id, "total_items": total_items, "progress": percent}
@@ -390,7 +523,9 @@ def roadmap_progress(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    total_items = db.query(func.count(RoadmapItem.id)).filter(RoadmapItem.roadmap_id == roadmap_id).scalar()
+    total_items = db.query(func.count(RoadmapMini.id)).filter(RoadmapMini.roadmap_id == roadmap_id).scalar()
+    if not total_items:
+        total_items = db.query(func.count(RoadmapItem.id)).filter(RoadmapItem.roadmap_id == roadmap_id).scalar()
     if not total_items:
         return {"roadmap_id": roadmap_id, "total_items": 0, "students": []}
 
@@ -418,20 +553,36 @@ def roadmap_progress(
     if not assigned_students:
         return {"roadmap_id": roadmap_id, "total_items": total_items, "students": []}
 
-    correct_subquery = (
-        db.query(
-            RoadmapAttempt.student_id.label("student_id"),
-            func.count(distinct(RoadmapAttempt.roadmap_item_id)).label("correct_count"),
+    if db.query(func.count(RoadmapMini.id)).filter(RoadmapMini.roadmap_id == roadmap_id).scalar():
+        correct_subquery = (
+            db.query(
+                RoadmapAttempt.student_id.label("student_id"),
+                func.count(distinct(RoadmapAttempt.mini_roadmap_id)).label("correct_count"),
+            )
+            .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+            .filter(
+                RoadmapItem.roadmap_id == roadmap_id,
+                RoadmapAttempt.status == AttemptStatus.correct,
+                RoadmapAttempt.student_id.in_(assigned_students),
+            )
+            .group_by(RoadmapAttempt.student_id)
+            .subquery()
         )
-        .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
-        .filter(
-            RoadmapItem.roadmap_id == roadmap_id,
-            RoadmapAttempt.status == AttemptStatus.correct,
-            RoadmapAttempt.student_id.in_(assigned_students),
+    else:
+        correct_subquery = (
+            db.query(
+                RoadmapAttempt.student_id.label("student_id"),
+                func.count(distinct(RoadmapAttempt.roadmap_item_id)).label("correct_count"),
+            )
+            .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+            .filter(
+                RoadmapItem.roadmap_id == roadmap_id,
+                RoadmapAttempt.status == AttemptStatus.correct,
+                RoadmapAttempt.student_id.in_(assigned_students),
+            )
+            .group_by(RoadmapAttempt.student_id)
+            .subquery()
         )
-        .group_by(RoadmapAttempt.student_id)
-        .subquery()
-    )
 
     students = (
         db.query(User.id, User.email, correct_subquery.c.correct_count)
@@ -454,38 +605,40 @@ def roadmap_summary(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    totals = (
-        db.query(Roadmap.id, Roadmap.title, func.count(RoadmapItem.id).label("total_items"))
-        .join(RoadmapItem, RoadmapItem.roadmap_id == Roadmap.id)
-        .group_by(Roadmap.id)
-        .subquery()
-    )
-
-    correct = (
-        db.query(
-            RoadmapItem.roadmap_id.label("roadmap_id"),
-            func.count(distinct(RoadmapAttempt.roadmap_item_id)).label("correct_items"),
-        )
-        .join(RoadmapAttempt, RoadmapAttempt.roadmap_item_id == RoadmapItem.id)
-        .filter(RoadmapAttempt.status == AttemptStatus.correct)
-        .group_by(RoadmapItem.roadmap_id)
-        .subquery()
-    )
-
-    rows = (
-        db.query(totals.c.id, totals.c.title, totals.c.total_items, correct.c.correct_items)
-        .outerjoin(correct, totals.c.id == correct.c.roadmap_id)
-        .all()
-    )
-
+    roadmaps = db.query(Roadmap).order_by(Roadmap.created_at.desc()).all()
     response = []
-    for roadmap_id, title, total_items, correct_items in rows:
+    for roadmap in roadmaps:
+        total_items = db.query(func.count(RoadmapMini.id)).filter(RoadmapMini.roadmap_id == roadmap.id).scalar()
+        if not total_items:
+            total_items = db.query(func.count(RoadmapItem.id)).filter(RoadmapItem.roadmap_id == roadmap.id).scalar()
+
+        if db.query(func.count(RoadmapMini.id)).filter(RoadmapMini.roadmap_id == roadmap.id).scalar():
+            correct_items = (
+                db.query(func.count(distinct(RoadmapAttempt.mini_roadmap_id)))
+                .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+                .filter(
+                    RoadmapItem.roadmap_id == roadmap.id,
+                    RoadmapAttempt.status == AttemptStatus.correct,
+                )
+                .scalar()
+            )
+        else:
+            correct_items = (
+                db.query(func.count(distinct(RoadmapAttempt.roadmap_item_id)))
+                .join(RoadmapItem, RoadmapItem.id == RoadmapAttempt.roadmap_item_id)
+                .filter(
+                    RoadmapItem.roadmap_id == roadmap.id,
+                    RoadmapAttempt.status == AttemptStatus.correct,
+                )
+                .scalar()
+            )
+
         completed = correct_items or 0
         percent = int((completed / total_items) * 100) if total_items else 0
         response.append(
             {
-                "roadmap_id": roadmap_id,
-                "title": title,
+                "roadmap_id": roadmap.id,
+                "title": roadmap.title,
                 "total_items": total_items,
                 "completed_items": completed,
                 "progress": percent,

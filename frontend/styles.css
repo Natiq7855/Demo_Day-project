@@ -358,6 +358,66 @@ textarea {
   padding: 10px;
 }
 
+.choice input[type="radio"] {
+  margin-right: 10px;
+}
+
+.loading-bar {
+  background: #e9eef6;
+  border-radius: 999px;
+  height: 8px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.loading-bar span {
+  animation: loading-sweep 1.2s ease-in-out infinite;
+  background: linear-gradient(90deg, #c5d6f2, #1f7a6d, #c5d6f2);
+  display: block;
+  height: 100%;
+  width: 40%;
+}
+
+@keyframes loading-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.pdf-selection {
+  display: grid;
+  gap: 10px;
+}
+
+.pdf-row {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(180px, 1.2fr) repeat(2, minmax(110px, 1fr)) auto;
+}
+
+.exam-card {
+  display: grid;
+  gap: 12px;
+}
+
+.exam-header {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.exam-answers {
+  display: grid;
+  justify-items: end;
+  text-align: right;
+  min-width: 140px;
+}
+
 @media (max-width: 900px) {
   .auth-wrap,
   .layout,

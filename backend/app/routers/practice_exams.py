@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 
 import json
+import re
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -12,7 +13,7 @@ from app.core.config import settings
 from app.core.security import require_admin, require_student
 from app.db.models import Class, Group, PracticeExam, PracticeExamAssignment, PracticeExamAttempt, User, UserRole
 from app.db.session import get_db
-from app.schemas.assignments import PracticeExamAssignRequest
+from app.schemas.assignments import PracticeExamAssignRequest, PracticeExamUnassignRequest
 from app.schemas.practice_exams import PracticeExamSubmitRequest
 
 router = APIRouter()
@@ -37,6 +38,11 @@ def _parse_answer_key(raw: str) -> list[str]:
 
 def _normalize_answer(value: str) -> str:
     return " ".join(str(value or "").strip().lower().split())
+
+
+def _sanitize_letter_answer(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z]", "", str(value or ""))
+    return cleaned.upper()
 
 
 def _count_correct(answer_key: list[str], answers: list[str]) -> int:
@@ -163,12 +169,26 @@ def list_practice_exams(
         .order_by(PracticeExam.created_at.desc())
         .all()
     )
+    exam_ids = [exam.id for exam in exams]
+    attempts = {}
+    if exam_ids:
+        rows = (
+            db.query(PracticeExamAttempt)
+            .filter(
+                PracticeExamAttempt.student_id == current_user.id,
+                PracticeExamAttempt.practice_exam_id.in_(exam_ids),
+            )
+            .all()
+        )
+        attempts = {row.practice_exam_id: row for row in rows}
     return [
         {
             "id": item.id,
             "title": item.title,
             "created_at": item.created_at,
             "question_count": len(item.answer_key or []),
+            "submitted": item.id in attempts,
+            "score": attempts[item.id].score if item.id in attempts else None,
         }
         for item in exams
     ]
@@ -180,13 +200,24 @@ def submit_practice_exam(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
+    existing_attempt = (
+        db.query(PracticeExamAttempt)
+        .filter(
+            PracticeExamAttempt.practice_exam_id == payload.practice_exam_id,
+            PracticeExamAttempt.student_id == current_user.id,
+        )
+        .one_or_none()
+    )
+    if existing_attempt:
+        raise HTTPException(status_code=400, detail="You already submitted this exam")
+
     exam = db.get(PracticeExam, payload.practice_exam_id)
     if not exam:
         raise HTTPException(status_code=404, detail="Practice exam not found")
     if not exam.answer_key:
         raise HTTPException(status_code=400, detail="Answer sheet not available for this exam")
 
-    answers = payload.answers or []
+    answers = [_sanitize_letter_answer(answer) for answer in (payload.answers or [])]
     answer_key = [str(item) for item in exam.answer_key or []]
     total = len(answer_key)
     if total == 0:
@@ -234,6 +265,53 @@ def assign_practice_exam(
     )
     db.commit()
     return {"status": "assigned"}
+
+
+@router.post("/admin/unassign")
+def unassign_practice_exam(
+    payload: PracticeExamUnassignRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    exam = db.get(PracticeExam, payload.practice_exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Practice exam not found")
+
+    _validate_assignment_target(db, payload.target_type, payload.target_id)
+
+    deleted = (
+        db.query(PracticeExamAssignment)
+        .filter(
+            PracticeExamAssignment.practice_exam_id == payload.practice_exam_id,
+            PracticeExamAssignment.target_type == payload.target_type,
+            PracticeExamAssignment.target_id == payload.target_id,
+        )
+        .delete()
+    )
+    db.commit()
+    return {"status": "unassigned", "deleted": deleted}
+
+
+@router.delete("/admin/{exam_id}")
+def delete_practice_exam(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    exam = db.get(PracticeExam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Practice exam not found")
+
+    db.query(PracticeExamAssignment).filter(PracticeExamAssignment.practice_exam_id == exam_id).delete()
+    db.query(PracticeExamAttempt).filter(PracticeExamAttempt.practice_exam_id == exam_id).delete()
+    db.delete(exam)
+    db.commit()
+
+    file_path = Path(exam.file_path)
+    if file_path.exists():
+        file_path.unlink(missing_ok=True)
+
+    return {"status": "deleted"}
 
 
 @router.get("/admin/download/{exam_id}")

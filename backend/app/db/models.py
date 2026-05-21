@@ -112,12 +112,23 @@ class Roadmap(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class RoadmapMini(Base):
+    __tablename__ = "roadmap_minis"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    roadmap_id: Mapped[int] = mapped_column(ForeignKey("roadmaps.id"))
+    question_type: Mapped[str] = mapped_column(String(120))
+    sequence_index: Mapped[int] = mapped_column(Integer)
+
+
 class RoadmapSourcePdf(Base):
     __tablename__ = "roadmap_source_pdfs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     roadmap_id: Mapped[int] = mapped_column(ForeignKey("roadmaps.id"))
     pdf_id: Mapped[int] = mapped_column(ForeignKey("pdfs.id"))
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
 
 
 class RoadmapItem(Base):
@@ -125,10 +136,12 @@ class RoadmapItem(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     roadmap_id: Mapped[int] = mapped_column(ForeignKey("roadmaps.id"))
+    mini_roadmap_id: Mapped[int | None] = mapped_column(ForeignKey("roadmap_minis.id"))
     topic: Mapped[str] = mapped_column(String(255))
     question_type: Mapped[str] = mapped_column(String(120))
     difficulty: Mapped[str] = mapped_column(String(20))
     sequence_index: Mapped[int] = mapped_column(Integer)
+    order_in_mini: Mapped[int | None] = mapped_column(Integer)
     metadata_: Mapped[dict | None] = mapped_column("metadata", json_type)
 
 
@@ -148,6 +161,7 @@ class RoadmapAttempt(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     student_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     roadmap_item_id: Mapped[int] = mapped_column(ForeignKey("roadmap_items.id"))
+    mini_roadmap_id: Mapped[int | None] = mapped_column(ForeignKey("roadmap_minis.id"))
     attempt_no: Mapped[int] = mapped_column(Integer)
     status: Mapped[AttemptStatus] = mapped_column(Enum(AttemptStatus))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -159,9 +173,11 @@ class RoadmapState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     student_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     roadmap_item_id: Mapped[int] = mapped_column(ForeignKey("roadmap_items.id"))
+    mini_roadmap_id: Mapped[int | None] = mapped_column(ForeignKey("roadmap_minis.id"))
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     phase: Mapped[RoadmapPhase] = mapped_column(Enum(RoadmapPhase), default=RoadmapPhase.A)
     last_question_id: Mapped[int | None] = mapped_column(ForeignKey("ai_questions.id"))
+    step_index: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
