@@ -4,3 +4,4 @@ __pycache__/
 *.log
 backend/storage/
 backend/.env
+frontend/config.js

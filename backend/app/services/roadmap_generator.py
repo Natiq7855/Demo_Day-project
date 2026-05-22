@@ -3,7 +3,7 @@ import json
 from sqlalchemy.orm import Session
 
 from app.db.models import AiQuestion, Roadmap, RoadmapItem
-from app.services.groq_client import create_json_completion
+from app.services.gemini_client import create_json_completion
 from app.utils.json_schema import ROADMAP_SCHEMA
 
 
@@ -14,6 +14,18 @@ REQUIRED_QUESTION_TYPES = [
     "problem_solving",
     "concept_explanation",
 ]
+
+
+def _parse_json_payload(content: str) -> dict:
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.removeprefix("```json").removeprefix("```").strip()
+        if "```" in text:
+            text = text.split("```", 1)[0].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Gemini returned invalid JSON: {error}") from error
 
 
 def _extract_items(payload: dict) -> list[dict]:
@@ -28,7 +40,7 @@ def _extract_items(payload: dict) -> list[dict]:
     if isinstance(payload.get("roadmap"), dict) and isinstance(payload["roadmap"].get("items"), list):
         return payload["roadmap"]["items"]
 
-    raise ValueError(f"Groq returned roadmap JSON without an items list. Keys: {', '.join(payload.keys())}")
+    raise ValueError(f"Gemini returned roadmap JSON without an items list. Keys: {', '.join(payload.keys())}")
 
 
 def generate_roadmap(
@@ -63,10 +75,10 @@ def generate_roadmap(
         },
     ]
     content = create_json_completion(messages, ROADMAP_SCHEMA)
-    payload = json.loads(content)
+    payload = _parse_json_payload(content)
     items = _extract_items(payload)
     if not items:
-        raise ValueError("Groq returned an empty roadmap.")
+        raise ValueError("Gemini returned an empty roadmap.")
 
     roadmap = Roadmap(
         title=title,
@@ -118,7 +130,7 @@ def generate_roadmap(
                 answer_key=item.get("answer_key"),
                 explanation=item.get("explanation"),
                 hint=item.get("hint"),
-                source="teacher_groq",
+                source="teacher_gemini",
             )
         )
 

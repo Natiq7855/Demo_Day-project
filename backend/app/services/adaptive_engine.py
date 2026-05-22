@@ -4,7 +4,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.db.models import AiQuestion, RoadmapItem, RoadmapPhase, RoadmapState
-from app.services.groq_client import create_json_completion
+from app.services.gemini_client import create_json_completion
 from app.utils.json_schema import QUESTION_SCHEMA
 
 

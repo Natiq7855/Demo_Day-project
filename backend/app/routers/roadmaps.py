@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Depends, HTTPException
-from groq import APIError
 from sqlalchemy import and_, distinct, func, or_
 from sqlalchemy.orm import Session
 
@@ -26,9 +25,19 @@ from app.schemas.assignments import RoadmapAssignRequest
 from app.schemas.attempts import SubmitAttemptRequest
 from app.schemas.roadmap import NextQuestionRequest, RoadmapGenerateRequest
 from app.services.adaptive_engine import generate_next_question
+from app.services.gemini_client import GeminiServiceError
 from app.services.roadmap_generator import generate_roadmap
 
 router = APIRouter()
+
+
+def _pdf_page_bounds(db: Session, pdf_id: int) -> tuple[int | None, int | None]:
+    row = (
+        db.query(func.min(PdfChunk.page_start), func.max(PdfChunk.page_end))
+        .filter(PdfChunk.pdf_id == pdf_id)
+        .one()
+    )
+    return row[0], row[1]
 
 
 def _get_pdf_context(
@@ -38,13 +47,12 @@ def _get_pdf_context(
     page_end: int | None,
 ) -> str:
     query = db.query(PdfChunk).filter(PdfChunk.pdf_id == pdf_id)
-    if page_start is not None and page_end is not None:
-        query = query.filter(
-            PdfChunk.page_end >= page_start,
-            PdfChunk.page_start <= page_end,
-        )
+    if page_start is not None:
+        query = query.filter(PdfChunk.page_end >= page_start)
+    if page_end is not None:
+        query = query.filter(PdfChunk.page_start <= page_end)
     chunks = query.order_by(PdfChunk.chunk_index).all()
-    return "\n".join(chunk.content_text for chunk in chunks)
+    return "\n".join(chunk.content_text for chunk in chunks if chunk.content_text.strip())
 
 
 def _get_roadmap_context(db: Session, roadmap_item_id: int) -> str:
@@ -151,9 +159,35 @@ def create_roadmap(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    if payload.page_start is not None and payload.page_end is not None and payload.page_start > payload.page_end:
+        raise HTTPException(status_code=400, detail="page_start must be less than or equal to page_end")
+
+    page_min, page_max = _pdf_page_bounds(db, payload.pdf_id)
+    if page_min is None or page_max is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This PDF has no indexed text. Re-upload a text-based PDF first.",
+        )
+
     chunk_context = _get_pdf_context(db, payload.pdf_id, payload.page_start, payload.page_end)
     if not chunk_context:
-        raise HTTPException(status_code=400, detail="No PDF content found for selection")
+        requested = (
+            f"pages {payload.page_start}-{payload.page_end}"
+            if payload.page_start is not None and payload.page_end is not None
+            else f"from page {payload.page_start}"
+            if payload.page_start is not None
+            else f"through page {payload.page_end}"
+            if payload.page_end is not None
+            else "the selected range"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No PDF content found for {requested}. "
+                f"This PDF has readable text on pages {page_min}-{page_max}. "
+                "Leave both page fields empty to use the full PDF."
+            ),
+        )
 
     try:
         roadmap_id = generate_roadmap(
@@ -165,12 +199,15 @@ def create_roadmap(
             page_start=payload.page_start,
             page_end=payload.page_end,
         )
-    except APIError as error:
+    except ValueError as error:
         db.rollback()
-        raise HTTPException(status_code=502, detail=f"Groq roadmap generation failed: {error}") from error
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except GeminiServiceError as error:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=str(error)) from error
     except Exception as error:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Roadmap generation failed: {error}") from error
+        raise HTTPException(status_code=502, detail=f"Gemini roadmap generation failed: {error}") from error
     return {"roadmap_id": roadmap_id}
 
 
