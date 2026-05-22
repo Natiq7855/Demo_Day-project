@@ -3,13 +3,14 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import require_admin
 from app.db.models import Pdf, PdfChunk, User, UserRole, UserStatus
 from app.db.session import get_db
-from app.services.pdf_extractor import chunk_text, extract_text_by_page
+from app.services.pdf_extractor import chunk_text, extract_text_by_page, pdf_text_stats
 
 router = APIRouter()
 
@@ -38,14 +39,28 @@ def list_pdfs(
     _: User = Depends(require_admin),
 ):
     pdfs = db.query(Pdf).order_by(Pdf.created_at.desc()).all()
-    return [
-        {
-            "id": item.id,
-            "title": item.title,
-            "created_at": item.created_at,
-        }
-        for item in pdfs
-    ]
+    response = []
+    for item in pdfs:
+        stats = (
+            db.query(
+                func.count(PdfChunk.id).label("chunks"),
+                func.max(PdfChunk.page_end).label("page_max"),
+                func.min(PdfChunk.page_start).label("page_min"),
+            )
+            .filter(PdfChunk.pdf_id == item.id)
+            .one()
+        )
+        response.append(
+            {
+                "id": item.id,
+                "title": item.title,
+                "created_at": item.created_at,
+                "chunks": stats.chunks or 0,
+                "page_min": stats.page_min,
+                "page_max": stats.page_max,
+            }
+        )
+    return response
 
 
 @router.post("/upload-pdf")
@@ -74,8 +89,22 @@ def upload_pdf(
     db.flush()
 
     pages = extract_text_by_page(str(file_path))
+    text_stats = pdf_text_stats(pages)
+    if text_stats["non_empty_pages"] == 0:
+        db.rollback()
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No readable text found in this PDF. "
+                "Use a text-based PDF (not a scan/photo). OCR is not enabled in this demo."
+            ),
+        )
+
     chunk_count = 0
     for index, (chunk, page_start, page_end) in enumerate(chunk_text(pages), start=1):
+        if not chunk.strip():
+            continue
         chunk_count += 1
         db.add(
             PdfChunk(
@@ -88,8 +117,21 @@ def upload_pdf(
             )
         )
 
+    if chunk_count == 0:
+        db.rollback()
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="PDF uploaded but no indexable chunks were created")
+
     db.commit()
-    return {"pdf_id": pdf.id, "chunks": chunk_count}
+    return {
+        "pdf_id": pdf.id,
+        "chunks": chunk_count,
+        "pages": text_stats["pages"],
+        "non_empty_pages": text_stats["non_empty_pages"],
+        "total_chars": text_stats["total_chars"],
+        "page_min": 1,
+        "page_max": text_stats["pages"],
+    }
 
 
 @router.get("/download-pdf/{pdf_id}")

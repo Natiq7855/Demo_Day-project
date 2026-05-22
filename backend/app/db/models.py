@@ -170,7 +170,7 @@ class AiQuestion(Base):
     answer_key: Mapped[dict | None] = mapped_column(json_type)
     explanation: Mapped[str | None] = mapped_column(Text)
     hint: Mapped[str | None] = mapped_column(Text)
-    source: Mapped[str] = mapped_column(String(20), default="groq")
+    source: Mapped[str] = mapped_column(String(20), default="gemini")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

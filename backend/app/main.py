@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.db.base import Base
@@ -7,6 +10,8 @@ from app.db.session import engine
 from app.routers import admin, auth, practice_exams, roadmaps, users
 
 app = FastAPI(title="Curricula AI API")
+
+FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,3 +38,6 @@ app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(roadmaps.router, prefix="/roadmaps", tags=["roadmaps"])
 app.include_router(users.router, prefix="/users", tags=["users"])
 app.include_router(practice_exams.router, prefix="/practice-exams", tags=["practice-exams"])
+
+if FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

@@ -2,7 +2,9 @@ if (window.location.protocol === "file:") {
   window.location.href = `http://127.0.0.1:5501/${window.location.pathname.split(/[\\/]/).pop() || "index.html"}`;
 }
 
-let API_BASE = localStorage.getItem("curricula_api_base") || "http://127.0.0.1:8010";
+const DEFAULT_API_BASE =
+  (window.CURRICULA_CONFIG && window.CURRICULA_CONFIG.apiBase) || "http://127.0.0.1:8000";
+let API_BASE = localStorage.getItem("curricula_api_base") || DEFAULT_API_BASE;
 const pageName = window.location.pathname.split("/").pop();
 const state = {
   token: localStorage.getItem("curricula_token") || "",
@@ -38,14 +40,33 @@ async function api(path, options = {}) {
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    throw new Error(payload.detail || payload.message || "Request failed");
+    throw new Error(formatApiError(payload));
   }
   return payload;
+}
+
+function formatApiError(payload) {
+  const detail = payload?.detail ?? payload?.message;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item.msg || item).join(", ");
+  }
+  if (detail && typeof detail === "object") {
+    return detail.msg || JSON.stringify(detail);
+  }
+  return detail || "Request failed";
 }
 
 function setMessage(message, error = "") {
   state.message = message;
   state.error = error;
+  render();
+}
+
+function renderInPlace() {
+  if (!state.token || !state.me) {
+    renderAuth();
+    return;
+  }
   render();
 }
 
@@ -106,6 +127,28 @@ async function loadView() {
     state.error = error.message;
   }
   render();
+}
+
+async function refreshContentStudio() {
+  const [pdfs, summary, classes, groups, students, exams] = await Promise.all([
+    api("/admin/pdfs"),
+    api("/roadmaps/admin/summary"),
+    api("/users/classes"),
+    api("/users/groups"),
+    api("/admin/students"),
+    api("/practice-exams/admin/list"),
+  ]);
+  state.data = { ...state.data, pdfs, summary, classes, groups, students, exams };
+}
+
+async function refreshStudentsView() {
+  const [students, pending, classes, groups] = await Promise.all([
+    api("/admin/students"),
+    api("/admin/pending-users"),
+    api("/users/classes"),
+    api("/users/groups"),
+  ]);
+  state.data = { ...state.data, students, pending, classes, groups };
 }
 
 async function loadAdmin() {
@@ -170,7 +213,7 @@ function renderAuth() {
         <div>
           <div class="brand"><span class="brand-mark">CA</span> Curricula AI</div>
           <h1>Adaptive learning for every classroom.</h1>
-          <p>Manage approvals, upload learning material, generate Groq-powered roadmaps, and give students a focused practice workspace.</p>
+          <p>Manage approvals, upload learning material, generate Gemini-powered roadmaps, and give students a focused practice workspace.</p>
         </div>
       </section>
       <section class="auth-panel">
@@ -363,14 +406,19 @@ function adminContent() {
       <div class="card">
         <h3>Generate Questions</h3>
         <form class="form" data-action="generate-roadmap">
-          <label>PDF<select name="pdf_id" required>${options(pdfs)}</select></label>
+          <label>PDF<select name="pdf_id" required>${pdfOptions(pdfs)}</select></label>
+          <p class="muted">Leave both page fields empty to use the full PDF. If you set a range, it must match the uploaded PDF page numbers shown in the list below.</p>
           <label>Roadmap title<input name="title" required /></label>
           <div class="grid two">
-            <label>Start page<input name="page_start" type="number" min="1" /></label>
-            <label>End page<input name="page_end" type="number" min="1" /></label>
+            <label>Start page<input name="page_start" type="number" min="1" placeholder="e.g. 1" /></label>
+            <label>End page<input name="page_end" type="number" min="1" placeholder="e.g. 12" /></label>
           </div>
           <button type="submit">Create question set</button>
         </form>
+      </div>
+      <div class="card">
+        <h3>Uploaded PDFs</h3>
+        ${pdfList(pdfs)}
       </div>
       <div class="card">
         <h3>Assign Roadmap</h3>
@@ -570,6 +618,27 @@ function options(items) {
   return (items || []).map((item) => `<option value="${item.id}">${escapeHtml(item.name || item.title || item.email || `#${item.id}`)}</option>`).join("");
 }
 
+function pdfOptions(items) {
+  return (items || []).map((item) => {
+    const range =
+      item.page_min && item.page_max ? ` · pages ${item.page_min}-${item.page_max}` : "";
+    const chunks = item.chunks ? ` · ${item.chunks} chunks` : "";
+    return `<option value="${item.id}">${escapeHtml(item.title)}${range}${chunks}</option>`;
+  }).join("");
+}
+
+function pdfList(items) {
+  if (!items.length) return `<p class="muted">No PDFs uploaded yet.</p>`;
+  return table(
+    ["Title", "Pages", "Chunks"],
+    items.map((item) => [
+      escapeHtml(item.title),
+      item.page_max ? `${item.page_min || 1}-${item.page_max}` : "-",
+      item.chunks || 0,
+    ]),
+  );
+}
+
 function roadmapOptions(items) {
   return (items || []).map((item) => `<option value="${item.roadmap_id}">${escapeHtml(item.title)}</option>`).join("");
 }
@@ -630,7 +699,12 @@ document.addEventListener("click", async (event) => {
         method: "POST",
         body: JSON.stringify({ user_id: Number(approve.dataset.approve), status: approve.dataset.status }),
       });
-      await loadView();
+      if (state.view === "students") {
+        await refreshStudentsView();
+        setMessage("Student status updated.");
+      } else {
+        await loadView();
+      }
     } catch (error) {
       setMessage("", error.message);
     }
@@ -652,7 +726,7 @@ document.addEventListener("click", async (event) => {
       explanation: item?.question?.explanation,
     };
     state.data.activeItemId = Number(question.dataset.question);
-    render();
+    renderInPlace();
     return;
   }
 
@@ -660,7 +734,7 @@ document.addEventListener("click", async (event) => {
   if (progress) {
     try {
       state.data.progressDetails = await api(`/roadmaps/admin/progress?roadmap_id=${progress.dataset.progress}`);
-      render();
+      renderInPlace();
     } catch (error) {
       setMessage("", error.message);
     }
@@ -719,24 +793,71 @@ document.addEventListener("submit", async (event) => {
       return;
     }
 
-    if (action === "create-class") await api("/users/classes", { method: "POST", body: JSON.stringify(data) });
-    if (action === "create-group") await api("/users/groups", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["class_id"])) });
-    if (action === "assign-student") await api("/users/assign-student", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["student_id", "class_id", "group_id"])) });
-    if (action === "generate-roadmap") await api("/roadmaps/generate", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["pdf_id", "page_start", "page_end"])) });
-    if (action === "assign-roadmap") await api("/roadmaps/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["roadmap_id", "target_id"])) });
-    if (action === "assign-exam") await api("/practice-exams/admin/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
-    if (action === "submit-exam") await api("/practice-exams/student/submit", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "score"])) });
+    if (action === "create-class") {
+      await api("/users/classes", { method: "POST", body: JSON.stringify(data) });
+      await refreshStudentsView();
+      setMessage("Class created.");
+      return;
+    }
+    if (action === "create-group") {
+      await api("/users/groups", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["class_id"])) });
+      await refreshStudentsView();
+      setMessage("Group created.");
+      return;
+    }
+    if (action === "assign-student") {
+      await api("/users/assign-student", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["student_id", "class_id", "group_id"])) });
+      await refreshStudentsView();
+      setMessage("Student assignment saved.");
+      return;
+    }
+    if (action === "generate-roadmap") {
+      const result = await api("/roadmaps/generate", {
+        method: "POST",
+        body: JSON.stringify(cleanNumbers(data, ["pdf_id", "page_start", "page_end"])),
+      });
+      if (state.view === "content") await refreshContentStudio();
+      setMessage(`Roadmap created (id ${result.roadmap_id}).`);
+      return;
+    }
+    if (action === "assign-roadmap") {
+      await api("/roadmaps/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["roadmap_id", "target_id"])) });
+      setMessage("Roadmap assigned.");
+      return;
+    }
+    if (action === "assign-exam") {
+      await api("/practice-exams/admin/assign", { method: "POST", body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "target_id"])) });
+      setMessage("Practice exam assigned.");
+      return;
+    }
+    if (action === "submit-exam") {
+      await api("/practice-exams/student/submit", {
+        method: "POST",
+        body: JSON.stringify(cleanNumbers(data, ["practice_exam_id", "score"])),
+      });
+      setMessage("Score saved.");
+      return;
+    }
 
     if (action === "upload-pdf") {
-      await upload("/admin/upload-pdf", form);
+      const result = await upload("/admin/upload-pdf", form);
+      if (state.view === "content") await refreshContentStudio();
+      setMessage(
+        `PDF indexed: ${result.pages} pages, ${result.chunks} chunks (${result.total_chars} characters).`,
+      );
+      return;
     }
     if (action === "upload-exam") {
       await upload("/practice-exams/admin/upload", form);
+      if (state.view === "content") await refreshContentStudio();
+      setMessage("Practice exam uploaded.");
+      return;
     }
     if (action === "load-roadmap-items") {
       state.data.activeRoadmapId = Number(data.roadmap_id);
       state.data.items = await api(`/roadmaps/${data.roadmap_id}/items`);
-      render();
+      state.data.question = null;
+      setMessage(`Loaded ${state.data.items.length} roadmap items.`);
       return;
     }
     if (action === "submit-attempt") {
@@ -749,11 +870,12 @@ document.addEventListener("submit", async (event) => {
         }),
       });
       state.data.question = null;
+      setMessage("Answer recorded.");
+      return;
     }
 
     await loadView();
-    state.message = "Done.";
-    render();
+    setMessage("Done.");
   } catch (error) {
     setMessage("", error.message);
   }
@@ -761,7 +883,7 @@ document.addEventListener("submit", async (event) => {
 
 async function upload(path, form) {
   const payload = new FormData(form);
-  await api(path, { method: "POST", body: payload });
+  return api(path, { method: "POST", body: payload });
 }
 
 async function downloadFile(path, fallbackName) {
@@ -773,7 +895,7 @@ async function downloadFile(path, fallbackName) {
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.detail || "Download failed");
+    throw new Error(formatApiError(payload) || "Download failed");
   }
   const blob = await response.blob();
   const disposition = response.headers.get("content-disposition") || "";
